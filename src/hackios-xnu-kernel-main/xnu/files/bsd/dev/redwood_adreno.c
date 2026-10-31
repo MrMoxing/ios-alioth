@@ -2339,6 +2339,37 @@ step_gmu_queues(void)
 	get(&rscc, "seq_mem_0_drv0", RSCC_SEQ_MEM_0_DRV0);
 
 programmed:
+	/*
+	 * a6xx_sptprac_enable(), which the vendor calls between starting the GMU and starting the HFI
+	 * (a6xx_gmu_fw_start: gmu_start -> gfx_rail_on -> sptprac -> hfi_start). From the moment
+	 * HFI_CTRL_INIT goes to 1 the GMU owns the rail and this request is refused -- which is what step 20
+	 * used to see. Its own test is "(status & 0x38) == 0x28": bits 5 and 3 up, bit 4 not collapsing.
+	 */
+	/* Linux powers the 3D core's domain (gpu_gx_gdsc) with runtime PM before its firmware start; here it was left
+	 * to the GMU, which does not do it until the core is asked for in step 17 -- so ask for it now. */
+	{
+		uint32_t gx = get(&gpucc, "gx_gdscr", GPUCC_GX_GDSCR);
+
+		if ((gx & GDSC_POWER_ON) == 0) {
+			put(&gpucc, "gx_gdscr (power on)", GPUCC_GX_GDSCR, gx & ~GDSC_SW_COLLAPSE);
+			wait_for(&gpucc, GPUCC_GX_GDSCR, GDSC_POWER_ON, GDSC_POWER_ON, 100);
+		}
+		get(&gpucc, "gx_gdscr", GPUCC_GX_GDSCR);
+	}
+	put(&gmu, "gx_sptprac_power_control", GMU_WORD(0x0081), 0x00778000);
+	{
+		uint32_t status = 0;
+
+		for (int i = 0; i < 100; i++) {
+			status = rd(gmu.base + GMU_SPTPRAC_PWR_CLK_STATUS);
+			if ((status & 0x38) == 0x28) {
+				break;
+			}
+			sleep_ms(1);
+		}
+		printf("adreno: %u: sptprac before the HFI starts: status %#x, %s\n", step, status,
+		    (status & 0x38) == 0x28 ? "UP" : "DID NOT COME UP");
+	}
 	announce("ask the GMU to start its message queues");
 	put(&gmu, "hfi_ctrl_init", GMU_HFI_CTRL_INIT, 1);
 	if (!wait_for(&gmu, GMU_HFI_CTRL_STATUS, 1, 1, 500)) {
@@ -2538,6 +2569,7 @@ hfi_send(const char *what, uint32_t id, uint32_t *message, uint32_t words)
 static struct block gpu = { "gpu", 0x03d00000, 0x40000 };
 #define GPU_WORD(n)             (4u * (n))
 #define RBBM_INT_0_STATUS       GPU_WORD(0x0201)
+#define RBBM_INT_0_MASK         GPU_WORD(0x0038)
 #define RBBM_STATUS             GPU_WORD(0x0210)
 #define RBBM_CLOCK_CNTL         GPU_WORD(0x00ae)
 #define CP_RB_BASE              GPU_WORD(0x0800)
@@ -2678,6 +2710,8 @@ step_core_power(void)
 #define CORE_SCRATCH_ADDRESS    0x01200000u
 #define CORE_TARGET_ADDRESS     0x10000000u
 #define CORE_NOWHERE            0x7f000000u     /* never given anything */
+#define CORE_PWRUP_AT           0x80            /* in the scratch page: the command processor's power-up list */
+#define CORE_RPTR_AT            0x08            /* ... and where it is to write its read pointer */
 
 #define GBIF_QSB_SIDE0          (4 * 0x03)      /* of the bus interface (step 6) */
 #define RBBM_GBIF_CLIENT_QOS_CNTL GPU_WORD(0x0011)
@@ -2714,7 +2748,190 @@ step_core_power(void)
 #define RBBM_SECVID_TSB_TRUSTED_SIZE GPU_WORD(0xf802)
 #define RBBM_SECVID_TSB_CNTL    GPU_WORD(0xf803)
 #define RBBM_SECVID_TSB_ADDR_MODE_CNTL GPU_WORD(0xf810)
-#define CP_RB_CNTL_VALUE        (12u | 2u << 8 | 1u << 27)      /* 2^12 pairs of words; do not copy the read position to memory */
+#define RBBM_SECVID_TRUST_CNTL  GPU_WORD(0xf400)        /* a6xx_gpu.c writes 0 here after the start */
+#define VBIF_GATE_OFF_WRREQ_EN  GPU_WORD(0x302a)
+#define RBBM_VBIF_CLIENT_QOS_CNTL GPU_WORD(0x0010)      /* not the GBIF one (0x11) this driver writes on a660 */
+#define CP_PROTECT_CNTL         GPU_WORD(0x084f)
+#define CP_PROTECT(n)           GPU_WORD(0x0850 + (n))
+#define GMU_GX_SPTPRAC_CLOCK_CONTROL GMU_WORD(0x0080)   /* a6xx_set_hwcg stops the shader clock around its table */
+/*
+ * 2^12 pairs of words (this ring is 8192 words; the vendor's is 2048, whose field is 10), and bit 27
+ * set, which is what the vendor's own driver and the working lmi port (tools/lmi-gpu-cp.c:
+ * CP_RB_CNTL = 0x0800020c) leave it at. This driver used to clear that bit and give CP_RB_RPTR_ADDR
+ * an address instead; adreno_rptr=1 still does, for a run that compares the two.
+ */
+#define CP_RB_CNTL_VALUE        ((1u << 27) | 12u | 2u << 8)
+
+/*
+ * The vendor's hardware clock-gating table (a6xx_gpu.c, a6xx_hwcg[]: 105 registers), written by
+ * a6xx_set_hwcg() with the shader processors' clock stopped and RBBM_CLOCK_CNTL last. Until now this
+ * driver left all of them at their reset values.
+ */
+static const struct {
+	uint32_t offset;
+	uint32_t value;
+} a6xx_hwcg[] = {
+	{ GPU_WORD(0x0b0), 0x22222222 },       /* RBBM_CLOCK_CNTL_SP0 */
+	{ GPU_WORD(0x0b1), 0x22222222 },       /* RBBM_CLOCK_CNTL_SP1 */
+	{ GPU_WORD(0x0b2), 0x22222222 },       /* RBBM_CLOCK_CNTL_SP2 */
+	{ GPU_WORD(0x0b3), 0x22222222 },       /* RBBM_CLOCK_CNTL_SP3 */
+	{ GPU_WORD(0x0b4), 0x02022220 },       /* RBBM_CLOCK_CNTL2_SP0 */
+	{ GPU_WORD(0x0b5), 0x02022220 },       /* RBBM_CLOCK_CNTL2_SP1 */
+	{ GPU_WORD(0x0b6), 0x02022220 },       /* RBBM_CLOCK_CNTL2_SP2 */
+	{ GPU_WORD(0x0b7), 0x02022220 },       /* RBBM_CLOCK_CNTL2_SP3 */
+	{ GPU_WORD(0x0b8), 0x00000080 },       /* RBBM_CLOCK_DELAY_SP0 */
+	{ GPU_WORD(0x0b9), 0x00000080 },       /* RBBM_CLOCK_DELAY_SP1 */
+	{ GPU_WORD(0x0ba), 0x00000080 },       /* RBBM_CLOCK_DELAY_SP2 */
+	{ GPU_WORD(0x0bb), 0x00000080 },       /* RBBM_CLOCK_DELAY_SP3 */
+	{ GPU_WORD(0x0bc), 0x0000f3cf },       /* RBBM_CLOCK_HYST_SP0 */
+	{ GPU_WORD(0x0bd), 0x0000f3cf },       /* RBBM_CLOCK_HYST_SP1 */
+	{ GPU_WORD(0x0be), 0x0000f3cf },       /* RBBM_CLOCK_HYST_SP2 */
+	{ GPU_WORD(0x0bf), 0x0000f3cf },       /* RBBM_CLOCK_HYST_SP3 */
+	{ GPU_WORD(0x0c0), 0x02222222 },       /* RBBM_CLOCK_CNTL_TP0 */
+	{ GPU_WORD(0x0c1), 0x02222222 },       /* RBBM_CLOCK_CNTL_TP1 */
+	{ GPU_WORD(0x0c2), 0x02222222 },       /* RBBM_CLOCK_CNTL_TP2 */
+	{ GPU_WORD(0x0c3), 0x02222222 },       /* RBBM_CLOCK_CNTL_TP3 */
+	{ GPU_WORD(0x0c4), 0x22222222 },       /* RBBM_CLOCK_CNTL2_TP0 */
+	{ GPU_WORD(0x0c5), 0x22222222 },       /* RBBM_CLOCK_CNTL2_TP1 */
+	{ GPU_WORD(0x0c6), 0x22222222 },       /* RBBM_CLOCK_CNTL2_TP2 */
+	{ GPU_WORD(0x0c7), 0x22222222 },       /* RBBM_CLOCK_CNTL2_TP3 */
+	{ GPU_WORD(0x0c8), 0x22222222 },       /* RBBM_CLOCK_CNTL3_TP0 */
+	{ GPU_WORD(0x0c9), 0x22222222 },       /* RBBM_CLOCK_CNTL3_TP1 */
+	{ GPU_WORD(0x0ca), 0x22222222 },       /* RBBM_CLOCK_CNTL3_TP2 */
+	{ GPU_WORD(0x0cb), 0x22222222 },       /* RBBM_CLOCK_CNTL3_TP3 */
+	{ GPU_WORD(0x0cc), 0x00022222 },       /* RBBM_CLOCK_CNTL4_TP0 */
+	{ GPU_WORD(0x0cd), 0x00022222 },       /* RBBM_CLOCK_CNTL4_TP1 */
+	{ GPU_WORD(0x0ce), 0x00022222 },       /* RBBM_CLOCK_CNTL4_TP2 */
+	{ GPU_WORD(0x0cf), 0x00022222 },       /* RBBM_CLOCK_CNTL4_TP3 */
+	{ GPU_WORD(0x0e0), 0x77777777 },       /* RBBM_CLOCK_HYST_TP0 */
+	{ GPU_WORD(0x0e1), 0x77777777 },       /* RBBM_CLOCK_HYST_TP1 */
+	{ GPU_WORD(0x0e2), 0x77777777 },       /* RBBM_CLOCK_HYST_TP2 */
+	{ GPU_WORD(0x0e3), 0x77777777 },       /* RBBM_CLOCK_HYST_TP3 */
+	{ GPU_WORD(0x0e4), 0x77777777 },       /* RBBM_CLOCK_HYST2_TP0 */
+	{ GPU_WORD(0x0e5), 0x77777777 },       /* RBBM_CLOCK_HYST2_TP1 */
+	{ GPU_WORD(0x0e6), 0x77777777 },       /* RBBM_CLOCK_HYST2_TP2 */
+	{ GPU_WORD(0x0e7), 0x77777777 },       /* RBBM_CLOCK_HYST2_TP3 */
+	{ GPU_WORD(0x0e8), 0x77777777 },       /* RBBM_CLOCK_HYST3_TP0 */
+	{ GPU_WORD(0x0e9), 0x77777777 },       /* RBBM_CLOCK_HYST3_TP1 */
+	{ GPU_WORD(0x0ea), 0x77777777 },       /* RBBM_CLOCK_HYST3_TP2 */
+	{ GPU_WORD(0x0eb), 0x77777777 },       /* RBBM_CLOCK_HYST3_TP3 */
+	{ GPU_WORD(0x0ec), 0x00077777 },       /* RBBM_CLOCK_HYST4_TP0 */
+	{ GPU_WORD(0x0ed), 0x00077777 },       /* RBBM_CLOCK_HYST4_TP1 */
+	{ GPU_WORD(0x0ee), 0x00077777 },       /* RBBM_CLOCK_HYST4_TP2 */
+	{ GPU_WORD(0x0ef), 0x00077777 },       /* RBBM_CLOCK_HYST4_TP3 */
+	{ GPU_WORD(0x0d0), 0x11111111 },       /* RBBM_CLOCK_DELAY_TP0 */
+	{ GPU_WORD(0x0d1), 0x11111111 },       /* RBBM_CLOCK_DELAY_TP1 */
+	{ GPU_WORD(0x0d2), 0x11111111 },       /* RBBM_CLOCK_DELAY_TP2 */
+	{ GPU_WORD(0x0d3), 0x11111111 },       /* RBBM_CLOCK_DELAY_TP3 */
+	{ GPU_WORD(0x0d4), 0x11111111 },       /* RBBM_CLOCK_DELAY2_TP0 */
+	{ GPU_WORD(0x0d5), 0x11111111 },       /* RBBM_CLOCK_DELAY2_TP1 */
+	{ GPU_WORD(0x0d6), 0x11111111 },       /* RBBM_CLOCK_DELAY2_TP2 */
+	{ GPU_WORD(0x0d7), 0x11111111 },       /* RBBM_CLOCK_DELAY2_TP3 */
+	{ GPU_WORD(0x0d8), 0x11111111 },       /* RBBM_CLOCK_DELAY3_TP0 */
+	{ GPU_WORD(0x0d9), 0x11111111 },       /* RBBM_CLOCK_DELAY3_TP1 */
+	{ GPU_WORD(0x0da), 0x11111111 },       /* RBBM_CLOCK_DELAY3_TP2 */
+	{ GPU_WORD(0x0db), 0x11111111 },       /* RBBM_CLOCK_DELAY3_TP3 */
+	{ GPU_WORD(0x0dc), 0x00011111 },       /* RBBM_CLOCK_DELAY4_TP0 */
+	{ GPU_WORD(0x0dd), 0x00011111 },       /* RBBM_CLOCK_DELAY4_TP1 */
+	{ GPU_WORD(0x0de), 0x00011111 },       /* RBBM_CLOCK_DELAY4_TP2 */
+	{ GPU_WORD(0x0df), 0x00011111 },       /* RBBM_CLOCK_DELAY4_TP3 */
+	{ GPU_WORD(0x10b), 0x22222222 },       /* RBBM_CLOCK_CNTL_UCHE */
+	{ GPU_WORD(0x10c), 0x22222222 },       /* RBBM_CLOCK_CNTL2_UCHE */
+	{ GPU_WORD(0x10d), 0x22222222 },       /* RBBM_CLOCK_CNTL3_UCHE */
+	{ GPU_WORD(0x10e), 0x00222222 },       /* RBBM_CLOCK_CNTL4_UCHE */
+	{ GPU_WORD(0x110), 0x00000004 },       /* RBBM_CLOCK_HYST_UCHE */
+	{ GPU_WORD(0x10f), 0x00000002 },       /* RBBM_CLOCK_DELAY_UCHE */
+	{ GPU_WORD(0x0f0), 0x22222222 },       /* RBBM_CLOCK_CNTL_RB0 */
+	{ GPU_WORD(0x0f1), 0x22222222 },       /* RBBM_CLOCK_CNTL_RB1 */
+	{ GPU_WORD(0x0f2), 0x22222222 },       /* RBBM_CLOCK_CNTL_RB2 */
+	{ GPU_WORD(0x0f3), 0x22222222 },       /* RBBM_CLOCK_CNTL_RB3 */
+	{ GPU_WORD(0x0f4), 0x00002222 },       /* RBBM_CLOCK_CNTL2_RB0 */
+	{ GPU_WORD(0x0f5), 0x00002222 },       /* RBBM_CLOCK_CNTL2_RB1 */
+	{ GPU_WORD(0x0f6), 0x00002222 },       /* RBBM_CLOCK_CNTL2_RB2 */
+	{ GPU_WORD(0x0f7), 0x00002222 },       /* RBBM_CLOCK_CNTL2_RB3 */
+	{ GPU_WORD(0x0f8), 0x00002220 },       /* RBBM_CLOCK_CNTL_CCU0 */
+	{ GPU_WORD(0x0f9), 0x00002220 },       /* RBBM_CLOCK_CNTL_CCU1 */
+	{ GPU_WORD(0x0fa), 0x00002220 },       /* RBBM_CLOCK_CNTL_CCU2 */
+	{ GPU_WORD(0x0fb), 0x00002220 },       /* RBBM_CLOCK_CNTL_CCU3 */
+	{ GPU_WORD(0x100), 0x00040f00 },       /* RBBM_CLOCK_HYST_RB_CCU0 */
+	{ GPU_WORD(0x101), 0x00040f00 },       /* RBBM_CLOCK_HYST_RB_CCU1 */
+	{ GPU_WORD(0x102), 0x00040f00 },       /* RBBM_CLOCK_HYST_RB_CCU2 */
+	{ GPU_WORD(0x103), 0x00040f00 },       /* RBBM_CLOCK_HYST_RB_CCU3 */
+	{ GPU_WORD(0x104), 0x05022022 },       /* RBBM_CLOCK_CNTL_RAC */
+	{ GPU_WORD(0x105), 0x00005555 },       /* RBBM_CLOCK_CNTL2_RAC */
+	{ GPU_WORD(0x106), 0x00000011 },       /* RBBM_CLOCK_DELAY_RAC */
+	{ GPU_WORD(0x107), 0x00445044 },       /* RBBM_CLOCK_HYST_RAC */
+	{ GPU_WORD(0x108), 0x04222222 },       /* RBBM_CLOCK_CNTL_TSE_RAS_RBBM */
+	{ GPU_WORD(0x114), 0x00222222 },       /* RBBM_CLOCK_MODE_GPC */
+	{ GPU_WORD(0x111), 0x00002222 },       /* RBBM_CLOCK_MODE_VFD */
+	{ GPU_WORD(0x10a), 0x00000000 },       /* RBBM_CLOCK_HYST_TSE_RAS_RBBM */
+	{ GPU_WORD(0x116), 0x04104004 },       /* RBBM_CLOCK_HYST_GPC */
+	{ GPU_WORD(0x113), 0x00000000 },       /* RBBM_CLOCK_HYST_VFD */
+	{ GPU_WORD(0x11c), 0x00000000 },       /* RBBM_CLOCK_DELAY_HLSQ */
+	{ GPU_WORD(0x109), 0x00004000 },       /* RBBM_CLOCK_DELAY_TSE_RAS_RBBM */
+	{ GPU_WORD(0x115), 0x00000200 },       /* RBBM_CLOCK_DELAY_GPC */
+	{ GPU_WORD(0x112), 0x00002222 },       /* RBBM_CLOCK_DELAY_VFD */
+	{ GPU_WORD(0x117), 0x00000002 },       /* RBBM_CLOCK_DELAY_HLSQ_2 */
+	{ GPU_WORD(0x11b), 0x00002222 },       /* RBBM_CLOCK_MODE_HLSQ */
+	{ GPU_WORD(0x118), 0x00000222 },       /* RBBM_CLOCK_CNTL_GMU_GX */
+	{ GPU_WORD(0x119), 0x00000111 },       /* RBBM_CLOCK_DELAY_GMU_GX */
+	{ GPU_WORD(0x11a), 0x00000555 },       /* RBBM_CLOCK_HYST_GMU_GX */
+};
+
+/* a6xx_gpu.h's A6XX_PROTECT_RW / A6XX_PROTECT_RDONLY: the command processor may not touch these. */
+#define A6XX_PROTECT_RW(reg, len)       ((1u << 31) | (((len) & 0x3fff) << 18) | ((reg) & 0x3ffff))
+#define A6XX_PROTECT_RDONLY(reg, len)   ((((len) & 0x3fff) << 18) | ((reg) & 0x3ffff))
+static const uint32_t a6xx_protect[] = {
+	A6XX_PROTECT_RDONLY(0x600, 0x51),
+	A6XX_PROTECT_RW(0xae50, 0x2),
+	A6XX_PROTECT_RW(0x9624, 0x13),
+	A6XX_PROTECT_RW(0x8630, 0x8),
+	A6XX_PROTECT_RW(0x9e70, 0x1),
+	A6XX_PROTECT_RW(0x9e78, 0x187),
+	A6XX_PROTECT_RW(0xf000, 0x810),
+	A6XX_PROTECT_RDONLY(0xfc00, 0x3),
+	A6XX_PROTECT_RW(0x50e, 0x0),
+	A6XX_PROTECT_RDONLY(0x50f, 0x0),
+	A6XX_PROTECT_RW(0x510, 0x0),
+	A6XX_PROTECT_RDONLY(0x0, 0x4f9),
+	A6XX_PROTECT_RDONLY(0x501, 0xa),
+	A6XX_PROTECT_RDONLY(0x511, 0x44),
+	A6XX_PROTECT_RW(0xe00, 0xe),
+	A6XX_PROTECT_RW(0x8e00, 0x0),
+	A6XX_PROTECT_RW(0x8e50, 0xf),
+	A6XX_PROTECT_RW(0xbe02, 0x0),
+	A6XX_PROTECT_RW(0xbe20, 0x11f3),
+	A6XX_PROTECT_RW(0x800, 0x82),
+	A6XX_PROTECT_RW(0x8a0, 0x8),
+	A6XX_PROTECT_RW(0x8ab, 0x19),
+	A6XX_PROTECT_RW(0x900, 0x4d),
+	A6XX_PROTECT_RW(0x98d, 0x76),
+	A6XX_PROTECT_RDONLY(0x8d0, 0x23),
+	A6XX_PROTECT_RDONLY(0x980, 0x4),
+	A6XX_PROTECT_RW(0xa630, 0x0),
+};
+
+/*
+ * The command processor's power-up register list for a650, in the order kgsl gives it
+ * (adreno_a6xx.c, a6xx_patch_pwrup_reglist: the IFPC-only list, the IFPC + preemption list, then the
+ * a650's own): 36 + 28 + 7 registers, as dword offsets. Until now this driver gave the processor no
+ * list at all, and the 8-word CP_ME_INIT it sent has neither the operation mode nor the list in it.
+ */
+static const uint32_t a650_pwrup_regs[] = {
+	/* a6xx_ifpc_pwrup_reglist */
+	0x0841, 0x0843, 0x084f, 0x0850, 0x0851, 0x0852, 0x0853, 0x0854,
+	0x0855, 0x0856, 0x0857, 0x0858, 0x0859, 0x085a, 0x085b, 0x085c,
+	0x085d, 0x085e, 0x085f, 0x0860, 0x0861, 0x0862, 0x0863, 0x0864,
+	0x0865, 0x0866, 0x0867, 0x0868, 0x0869, 0x086a, 0x086b, 0x086c,
+	0x086d, 0x086e, 0x086f, 0x098d,
+	/* a6xx_pwrup_reglist */
+	0x0c01, 0x8601, 0x8e05, 0x9e01, 0xbe05, 0xa601, 0x9601, 0x0e00,
+	0xae01, 0xb601, 0x0e05, 0x0e06, 0x0e09, 0x0e0a, 0x0e07, 0x0e08,
+	0x0e0b, 0x0e0c, 0x0e0d, 0x0e0e, 0x0e18, 0x0e17, 0x0e01, 0x8e08,
+	0xb604, 0xae02, 0x9e00, 0x8e50,
+	/* a650_pwrup_reglist */
+	0x0011, 0x087f, 0xb608, 0xb609, 0xb60a, 0xb60b, 0xb60c,
+};
 
 /* commands (Mesa's adreno_pm4.xml); a packet is a header word and so many more */
 #define CP_NOP                  0x10
@@ -2832,14 +3049,24 @@ step_core_space(void)
 {
 	const uint8_t *microcode;
 	uint64_t size = 0;
-	uint32_t stream1 = 1, direct = 0;
+	uint32_t stream1 = 0, direct = 0, cached = 0;     /* 0: the one entry (mask 0x401) takes streams 0 and 1, as the working alioth reference leaves it */
+	uint64_t core_pte;
 
 	if (!cx_ready() || !core_is_on) {
 		return false;
 	}
 	PE_parse_boot_argn("adreno_stream1", &stream1, sizeof(stream1));
 	PE_parse_boot_argn("adreno_direct", &direct, sizeof(direct));
+	/*
+	 * adreno_cached=1: the core's own memory is marked cacheable in the page tables (attribute 1 of
+	 * MAIR0, which is normal write-back) instead of attribute 0, normal non-cacheable. The command
+	 * processor's instruction fetch is the only access on this phone that has never worked, and how
+	 * that memory is described to it is one of the few things about it this driver chooses.
+	 */
+	PE_parse_boot_argn("adreno_cached", &cached, sizeof(cached));
 	core_direct = direct != 0;
+	core_pte = PTE_CORE | (cached ? PTE_CACHED : 0);
+	printf("adreno: %u: the 3D core's memory is %s to it\n", step, cached ? "cacheable" : "not cacheable");
 	announce("make the 3D core's memory: its ring, its microcode, a page to try writing to");
 	microcode = image_file("fw", soc->sqe_firmware, &size);
 	if (microcode == NULL || size < 8 || size > 0x40000) {
@@ -2871,9 +3098,9 @@ step_core_space(void)
 		get(&gpu, "rbbm_status", RBBM_STATUS);
 		return !space_faulted(&core_space);
 	}
-	if (!block_new(&core_space, &core_ring, CORE_RING_ADDRESS, CORE_RING_SIZE, PTE_CORE) ||
-	    !block_new(&core_space, &core_sqe, CORE_SQE_ADDRESS, (uint32_t)size - 4, PTE_CORE | PTE_READ_ONLY) ||
-	    !block_new(&core_space, &core_scratch, CORE_SCRATCH_ADDRESS, 4096, PTE_CORE)) {
+	if (!block_new(&core_space, &core_ring, CORE_RING_ADDRESS, CORE_RING_SIZE, core_pte) ||
+	    !block_new(&core_space, &core_sqe, CORE_SQE_ADDRESS, (uint32_t)size - 4, core_pte | PTE_READ_ONLY) ||
+	    !block_new(&core_space, &core_scratch, CORE_SCRATCH_ADDRESS, 4096, core_pte)) {
 		return false;
 	}
 	memcpy((void *)core_sqe.memory, microcode + 4, size - 4);       /* the file's first word is not microcode */
@@ -3036,27 +3263,48 @@ step_core_start(void)
 	 * starts the core (a6xx_gmu_sptprac_enable(): 0x00778000 into GMU_GX_SPTPRAC_POWER_CONTROL, then wait
 	 * for bit 3 of SPTPRAC_PWR_CLK_STATUS). Nothing here has ever written it.
 	 */
-	uint32_t sptprac = 0, sqe = 1, oob = 0;
+	uint32_t sptprac = 0, sqe = 1, oob = 1, hwcg = 1, protect = 1, vbif = 0;   /* sptprac is step 17's, before the HFI */
 	PE_parse_boot_argn("adreno_sptprac", &sptprac, sizeof(sptprac));
+	PE_parse_boot_argn("adreno_hwcg", &hwcg, sizeof(hwcg));
+	PE_parse_boot_argn("adreno_protect", &protect, sizeof(protect));
+	PE_parse_boot_argn("adreno_vbif", &vbif, sizeof(vbif));
+	printf("adreno: %u: the vendor's start switches: sptprac %u, hwcg %u, protect %u, vbif %u\n", step, sptprac, hwcg,
+	    protect, vbif);
 	PE_parse_boot_argn("adreno_sqe", &sqe, sizeof(sqe));
 	PE_parse_boot_argn("adreno_oob", &oob, sizeof(oob));
+	/*
+	 * a6xx_gmu.c's a6xx_sptprac_enable(): the CPU takes the shader/texture processors' power collapse in hand
+	 * (the vendor only does this when the GMU's idle level leaves it to the CPU). The vendor's test of that
+	 * same register is a6xx_gmu_sptprac_is_on(): bits 2 and 4 say the domain has no power, or no clock
+	 * (SPTPRAC_POWER_OFF | SP_CLK_OFF). The vendor gives it 100 us x 100; this waits up to 100 ms and
+	 * prints what it read either way.
+	 */
 	if (sptprac) {
 		put(&gmu, "gx_sptprac_power_control", GMU_WORD(0x0081), 0x00778000);
-		for (int i = 0; i < 20 && !(rd(gmu.base + GMU_SPTPRAC_PWR_CLK_STATUS) & (1u << 3)); i++) {
+		uint32_t status = 0;
+
+		for (int i = 0; i < 100; i++) {
+			status = rd(gmu.base + GMU_SPTPRAC_PWR_CLK_STATUS);
+			if ((status & 0x14) == 0) {
+				break;
+			}
 			sleep_ms(1);
 		}
-		printf("adreno: %u: sptprac switched on: control %#x, status %#x (bit 3 on, bit 2 off)\n", step,
-		    rd(gmu.base + GMU_WORD(0x0081)), rd(gmu.base + GMU_SPTPRAC_PWR_CLK_STATUS));
+		printf("adreno: %u: sptprac, asked for (control %#x): status %#x, %s (bits 2 and 4 off)\n", step,
+		    rd(gmu.base + GMU_WORD(0x0081)), status, (status & 0x14) == 0 ? "UP" : "DID NOT COME UP");
 	}
 	/*
-	 * adreno_oob=1: the handshake Linux makes around its whole hardware start (a6xx_gmu_set_oob,
-	 * GMU_OOB_GPU_SET): the GMU is told that this processor is working on the GPU and is to leave its
-	 * power alone, until the command processor runs. Without it the GMU is free to collapse the core
-	 * (inter-frame power collapse was asked for in step 17) while the registers below are written.
+	 * adreno_oob (default 1, the vendor's own arrangement): the handshake Linux makes around its whole
+	 * hardware start (a6xx_gmu_set_oob, GMU_OOB_GPU_SET): the GMU is told that this processor is working
+	 * on the GPU and is to leave its power alone, until the command processor runs. Without it the GMU is
+	 * free to collapse the core while the registers below are written -- and on this phone the GX domain
+	 * was found off (bits 6 and 7 of SPTPRAC_PWR_CLK_STATUS, the vendor's own test) right before the
+	 * command processor was started.
 	 * 1: the newer interrupt bits (request 30, acknowledge 31); 2: the older ones (16/24).
 	 */
+	bool gx_on = rd(gpucc.base + GPUCC_GX_GDSCR) & GDSC_POWER_ON;
 	if (oob) {
-		uint32_t request = oob == 2 ? 16 : 30, ack = oob == 2 ? 24 : 31, info = 0;
+		uint32_t request = oob == 2 ? 16 : 30, ack = oob == 2 ? 24 : 31, info = 0, status = 0;
 
 		put(&gmu, "host2gmu_intr_set", GMU_WORD(0x5194), 1u << request);
 		for (int i = 0; i < 100; i++) {
@@ -3068,12 +3316,72 @@ step_core_start(void)
 		}
 		printf("adreno: %u: the GMU is told to leave the GPU alone: it answers %#x (bit %u is its yes)\n", step, info, ack);
 		put(&gmu, "gmu2host_intr_clr", GMU_WORD(0x5191), 1u << ack);
+		/* a6xx_gmu_gx_is_on: bits 6 and 7 of the status say the 3D core has no power, or no clock. */
+		for (int i = 0; i < 100; i++) {
+			status = rd(gmu.base + GMU_SPTPRAC_PWR_CLK_STATUS);
+			gx_on = rd(gpucc.base + GPUCC_GX_GDSCR) & GDSC_POWER_ON;
+			if ((status & 0xc0) == 0 && gx_on) {
+				break;
+			}
+			sleep_ms(1);
+		}
+		printf("adreno: %u: the 3D core's power, after the GMU was told to leave it alone: status %#x (bits 6 and 7 "
+		    "say no power / no clock), gx_gdscr %#x (bit 31 says the switch is on): %s\n", step, status,
+		    rd(gpucc.base + GPUCC_GX_GDSCR), (status & 0xc0) == 0 && gx_on ? "ON" : "OFF");
 	}
 	put(&gbif, "halt", GBIF_HALT, 0);
 	put(&gpu, "rbbm_gbif_halt", RBBM_GBIF_HALT, 0);
-	put(&gpu, "rbbm_secvid_tsb_cntl", RBBM_SECVID_TSB_CNTL, 0);
-	put64(&gpu, "rbbm_secvid_tsb_trusted_base", RBBM_SECVID_TSB_TRUSTED_BASE, 0);
-	put(&gpu, "rbbm_secvid_tsb_trusted_size", RBBM_SECVID_TSB_TRUSTED_SIZE, 0);
+	/*
+	 * The GMU's AHB fence has to let the core's accesses through before any of them is made. The
+	 * lmi port (Fsasdddd/lmi-uefi-touch-gpu, tools/lmi-gpu-cp.c) gates its command-processor start on
+	 * exactly this: AO_AHB_FENCE_CTRL = 0, the status word's bits cleared, both read back, and a
+	 * starting point of zero. A fence left in its dropping mode silently swallows register writes
+	 * and makes a core that never returns look like a core that cannot start.
+	 */
+	{
+		uint32_t fence_ctrl, fence_status;
+
+		put(&gmu, "ahb_fence_status_clr", GMU_WORD(0x9314), 7);
+		put(&gmu, "ao_ahb_fence_ctrl (allow)", GMU_AO_AHB_FENCE_CTRL, 0);
+		fence_ctrl = get(&gmu, "ao_ahb_fence_ctrl after", GMU_AO_AHB_FENCE_CTRL);
+		fence_status = get(&gmu, "ahb_fence_status after", GMU_AHB_FENCE_STATUS);
+		printf("adreno: %u: the GMU's AHB fence is %s (control %#x, status %#x)\n", step,
+		    fence_ctrl == 0 && fence_status == 0 ? "ALLOWING" : "STILL DROPPING", fence_ctrl, fence_status);
+		if (fence_ctrl != 0 || fence_status != 0) {
+			return false;
+		}
+	}
+	/*
+	 * adreno_tsb=1: the two secure-TSB control writes. The lmi port, on the same Adreno 650
+	 * family, makes no secure register write at all before the start (it leaves secure mode later,
+	 * by command); both are kept behind a switch so a run can tell whether they matter.
+	 */
+	uint32_t tsb = 0;
+	PE_parse_boot_argn("adreno_tsb", &tsb, sizeof(tsb));
+	if (tsb) {
+		put(&gpu, "rbbm_secvid_tsb_cntl", RBBM_SECVID_TSB_CNTL, 0);
+		put64(&gpu, "rbbm_secvid_tsb_trusted_base", RBBM_SECVID_TSB_TRUSTED_BASE, 0);
+		put(&gpu, "rbbm_secvid_tsb_trusted_size", RBBM_SECVID_TSB_TRUSTED_SIZE, 0);
+	} else {
+		printf("adreno: %u: adreno_tsb=0: the secure-TSB controls are left as the boot loader set them\n", step);
+	}
+	/*
+	 * a6xx_set_hwcg(true): the vendor's 105 clock-gating registers, written with the shader processors'
+	 * clock stopped and RBBM_CLOCK_CNTL (0x8aa8aa02) last. This driver had always left them at their
+	 * reset values. adreno_hwcg=0 leaves them out again, for a run that tells whether they matter.
+	 */
+	if (hwcg) {
+		uint32_t clock_control = rd(gmu.base + GMU_GX_SPTPRAC_CLOCK_CONTROL);
+
+		wr(gmu.base + GMU_GX_SPTPRAC_CLOCK_CONTROL, clock_control & ~1u);
+		for (unsigned i = 0; i < sizeof(a6xx_hwcg) / sizeof(a6xx_hwcg[0]); i++) {
+			wr(gpu.base + a6xx_hwcg[i].offset, a6xx_hwcg[i].value);
+		}
+		wr(gmu.base + GMU_GX_SPTPRAC_CLOCK_CONTROL, clock_control | 1u);
+		put(&gpu, "rbbm_clock_cntl (gating on)", RBBM_CLOCK_CNTL, 0x8aa8aa02u);
+		printf("adreno: %u: the %u hardware clock-gating registers are written\n", step,
+		    (uint32_t)(sizeof(a6xx_hwcg) / sizeof(a6xx_hwcg[0])));
+	}
 	for (unsigned i = 0; i < sizeof(address_modes) / sizeof(address_modes[0]); i++) {
 		put(&gpu, "address mode: 64 bits", GPU_WORD(address_modes[i]), 1);
 	}
@@ -3081,6 +3389,18 @@ step_core_start(void)
 		put(&gbif, "qsb_side", GBIF_QSB_SIDE0 + 4 * i, 0x00071620);
 	}
 	put(&gpu, "rbbm_gbif_client_qos_cntl", RBBM_GBIF_CLIENT_QOS_CNTL, 3);
+	/*
+	 * a6xx_gpu.c's "VBIF start", a different register pair from the GBIF ones above. On this phone the
+	 * write to VBIF_GATE_OFF_WRREQ_EN is the one the machine does not come back from (the run's last
+	 * line is that access), so it is behind a switch: adreno_vbif=0 leaves it out.
+	 */
+	if (vbif) {
+		/* read it first: an address that does not answer never comes back, and that is worth telling apart
+		 * from a register whose value the machine does not like. */
+		get(&gpu, "vbif_gate_off_wrreq_en before", VBIF_GATE_OFF_WRREQ_EN);
+		put(&gpu, "vbif_gate_off_wrreq_en", VBIF_GATE_OFF_WRREQ_EN, 0x00000009);
+		put(&gpu, "rbbm_vbif_client_qos_cntl", RBBM_VBIF_CLIENT_QOS_CNTL, 3);
+	}
 	put(&gpu, "rbbm_perfctr_gpu_busy_masked", RBBM_PERFCTR_GPU_BUSY_MASKED, 0xffffffff);
 	put64(&gpu, "uche_write_range_max", UCHE_WRITE_RANGE_MAX, 0x0001ffffffffffc0ull);
 	put64(&gpu, "uche_trap_base", UCHE_TRAP_BASE, 0x0001fffffffff000ull);
@@ -3108,7 +3428,27 @@ step_core_start(void)
 	put(&gpu, "rbbm_nc_mode_cntl", GPU_WORD(0x0534), 1);
 	put(&gpu, "rbbm_perfctr_cntl", RBBM_PERFCTR_CNTL, 1);
 	put(&gpu, "rbbm_interface_hang_int_cntl", RBBM_INTERFACE_HANG_INT_CNTL, 1u << 30 | 0x1fffff);
+	/*
+	 * No interrupt the 3D core can raise is let out (kernel 1 = enabled on this register): this driver
+	 * polls, it has no handler at all, and a line that stays asserted with nobody to clear it is not
+	 * something the machine should have to live with. Linux enables them (A6XX_INT_MASK) because it has
+	 * handlers; UniXNU's working probe writes 0, the same as here.
+	 */
+	put(&gpu, "rbbm_int_0_mask", RBBM_INT_0_MASK, 0);
 	put(&gpu, "uche_client_pf", UCHE_CLIENT_PF, 1u << 7 | 1);
+	/*
+	 * The command processor's own protection map (a6xx_gpu.c: CP_PROTECT_CNTL = 3 and the 27
+	 * A6XX_PROTECT_RW/RDONLY entries). Without it the processor starts with no map at all, and the
+	 * first register it touches on its own may be one the microcode is not meant to see.
+	 */
+	if (protect) {
+		put(&gpu, "cp_protect_cntl", CP_PROTECT_CNTL, 3);
+		for (unsigned i = 0; i < sizeof(a6xx_protect) / sizeof(a6xx_protect[0]); i++) {
+			wr(gpu.base + CP_PROTECT(i), a6xx_protect[i]);
+		}
+		printf("adreno: %u: the command processor's %u protection entries are written\n", step,
+		    (uint32_t)(sizeof(a6xx_protect) / sizeof(a6xx_protect[0])));
+	}
 	/*
 	 * (Linux also sets TPL1's five bicubic weights registers on the a650 family. They only
 	 * affect how sampling filters, and their offsets are not in anything here that could be
@@ -3127,19 +3467,52 @@ step_core_start(void)
 	 * shows that its requests come through context 0 as meant, and what they look like.
 	 */
 	PE_parse_boot_argn("adreno_blind", &blind, sizeof(blind));
+	/*
+	 * adreno_sqe_halt (default 0, the working alioth reference's order): halt and soft-reset the
+	 * command processor once, before its bases are given to it. The reference driver (the
+	 * ios-alioth package that takes commands on this phone) makes no such write: its first access
+	 * after the bases is the start itself. Written before the bases, this control write latched a
+	 * zero base and the core's first fetch was refused by the SMMU at address 0 (status 0x402,
+	 * syndrome 0x30042) although CP_SQE_INSTR_BASE read back correctly. adreno_sqe_halt=1 brings
+	 * the old behaviour back for a run that compares them.
+	 */
+	uint32_t sqe_halt = 0;
+	PE_parse_boot_argn("adreno_sqe_halt", &sqe_halt, sizeof(sqe_halt));
+	if (sqe_halt) {
+		uint32_t halted = rd(gpu.base + CP_SQE_CNTL);
+
+		put(&gpu, "cp_sqe_cntl (halt and reset)", CP_SQE_CNTL, 3);
+		sleep_ms(10);
+		printf("adreno: %u: the command processor is halted before its bases are given to it: %#x -> %#x\n",
+		    step, halted, rd(gpu.base + CP_SQE_CNTL));
+	}
 	put64(&gpu, "cp_sqe_instr_base", CP_SQE_INSTR_BASE,
 	    blind ? CORE_NOWHERE : core_direct ? core_sqe.address : CORE_SQE_ADDRESS);
 	put64(&gpu, "cp_rb_base", CP_RB_BASE, core_direct ? core_ring.address : CORE_RING_ADDRESS);
 	/*
-	 * adreno_rptr=1: the vendor's setting for a GPU that has APRIV (a6xx_rb_start: the read pointer
-	 * is written to memory, at CP_RB_RPTR_ADDR, which is given a page of ours; only a GPU without
-	 * APRIV has CP_RB_CNTL bit 27 set so that nothing is written back). This driver has always kept
-	 * bit 27 set.
+	 * adreno_sqe_zero=1: the microcode block is wiped before the processor is started, so that the fetch
+	 * finds a valid address holding nothing valid. A run that still ends in a reset then says the reset
+	 * comes from the fetch itself; a run that ends in a readable fault says it comes from what the
+	 * microcode does once it runs.
 	 */
-	uint32_t rptr = 0;
+	uint32_t sqe_zero = 0;
+	PE_parse_boot_argn("adreno_sqe_zero", &sqe_zero, sizeof(sqe_zero));
+	if (sqe_zero) {
+		bzero((void *)core_sqe.memory, core_sqe.size);
+		to_memory(core_sqe.memory, core_sqe.size);
+		printf("adreno: %u: the microcode block is wiped (all zeroes) before the start\n", step);
+	}
+	/*
+	 * a6xx_rb_start: the vendor gives the ringbuffer's read pointer an address in memory, at
+	 * CP_RB_RPTR_ADDR, and leaves CP_RB_CNTL bit 27 (RPTR write-back to memory) clear -- that bit is set
+	 * only for a GPU without APRIV. This driver had always kept bit 27 set and given no address.
+	 * adreno_rptr=0 goes back to that, for a run that tells whether it matters.
+	 */
+	uint32_t rptr = 0;      /* the lmi port's working start leaves bit 27 set and gives no address */
 	PE_parse_boot_argn("adreno_rptr", &rptr, sizeof(rptr));
 	if (rptr) {
-		put64(&gpu, "cp_rb_rptr_addr", GPU_WORD(0x0804), core_scratch.address);
+		put64(&gpu, "cp_rb_rptr_addr", GPU_WORD(0x0804),
+		    (core_direct ? core_scratch.address : CORE_SCRATCH_ADDRESS) + CORE_RPTR_AT);
 		put(&gpu, "cp_rb_cntl", CP_RB_CNTL, CP_RB_CNTL_VALUE & ~(1u << 27));
 	} else {
 		put(&gpu, "cp_rb_cntl", CP_RB_CNTL, CP_RB_CNTL_VALUE);
@@ -3149,7 +3522,155 @@ step_core_start(void)
 	get(&gpu, "cp_rb_cntl", CP_RB_CNTL);
 	get(&gpu, "cp_apriv_cntl", CP_APRIV_CNTL);
 	get(&gpu, "rbbm_status", RBBM_STATUS);
+	/*
+	 * Read every start-critical register back and say which kept what was written, the way the lmi
+	 * port does (tools/lmi-gpu-cp.c: it refuses to start the command processor unless all eleven
+	 * match). A write the GMU's fence or a secure side swallowed is otherwise indistinguishable
+	 * from a start that fails on its own. adreno_verify=1 makes the mismatch stop the run; by
+	 * default the mask is only printed, so the run that produces it survives with its log.
+	 */
+	{
+		uint64_t instr = core_direct ? core_sqe.address : CORE_SQE_ADDRESS;
+		uint64_t rb = core_direct ? core_ring.address : CORE_RING_ADDRESS;
+		uint32_t rb_cntl = rptr ? (CP_RB_CNTL_VALUE & ~(1u << 27)) : CP_RB_CNTL_VALUE;
+		const struct {
+			uint32_t word, value;
+		} want[] = {
+			{ 0x0842, 1 },                  /* CP_ADDR_MODE_CNTL: 64-bit addresses */
+			{ 0x08c2, 0x02000140 },         /* CP_ROQ_THRESHOLDS_2 */
+			{ 0x08c1, 0x8040362c },         /* CP_ROQ_THRESHOLDS_1 */
+			{ 0x08c3, 128 },                /* CP_MEM_POOL_SIZE */
+			{ 0x098d, 1 },                  /* CP_AHB_CNTL */
+			{ 0x0844, 0x6e },               /* CP_APRIV_CNTL */
+			{ 0x0830, (uint32_t)instr },    /* CP_SQE_INSTR_BASE */
+			{ 0x0831, (uint32_t)(instr >> 32) },
+			{ 0x0800, (uint32_t)rb },       /* CP_RB_BASE */
+			{ 0x0801, (uint32_t)(rb >> 32) },
+			{ 0x0802, rb_cntl },            /* CP_RB_CNTL */
+		};
+		uint32_t mask = 0, verify = 0;
 
+		printf("adreno: %u: the command processor's configuration, read back:\n", step);
+		for (unsigned i = 0; i < sizeof(want) / sizeof(want[0]); i++) {
+			uint32_t got = rd(gpu.base + GPU_WORD(want[i].word));
+
+			printf("adreno: %u:   %#x = %#x (want %#x) %s\n", step, want[i].word, got, want[i].value,
+			    got == want[i].value ? "ok" : "MISMATCH");
+			if (got == want[i].value) {
+				mask |= 1u << i;
+			}
+		}
+		PE_parse_boot_argn("adreno_verify", &verify, sizeof(verify));
+		printf("adreno: %u: %u of 11 start registers kept their value (mask %#x)%s\n", step,
+		    __builtin_popcount(mask), mask, verify && mask != 0x7ff ? "; the start is NOT made" : "");
+		if (verify && mask != 0x7ff) {
+			return false;
+		}
+	}
+
+	/*
+	 * adreno_cp=0 stops here, so that everything written before the start (the clock-gating table, the
+	 * command processor's protection map) can be read back from a run that ends with the loader's log
+	 * rather than with the machine's reset -- the reset has no log.
+	 */
+	/*
+	 * RBBM_SECVID_TRUST_CNTL reads 1 here, before the command processor is started: the GPU is still in
+	 * its secure state, and a start written from the non-secure side is the kind of access that takes the
+	 * machine down without a word. The vendor clears it in its own start, so clear it here, before it.
+	 */
+	get(&gpu, "rbbm_secvid_trust_cntl", RBBM_SECVID_TRUST_CNTL);
+	uint32_t trust = 0;
+	PE_parse_boot_argn("adreno_trust", &trust, sizeof(trust));
+	if (trust) {
+		/* adreno_trust=1: the write on its own is the last thing the machine does (g36a), so it is not made by
+		 * default -- a register that reads but cannot be written from here is one the secure side still owns. */
+		put(&gpu, "rbbm_secvid_trust_cntl (before the start)", RBBM_SECVID_TRUST_CNTL, 0);
+		get(&gpu, "rbbm_secvid_trust_cntl", RBBM_SECVID_TRUST_CNTL);
+	}
+	uint32_t cp = 1;
+	PE_parse_boot_argn("adreno_cp", &cp, sizeof(cp));
+	if (!cp) {
+		printf("adreno: %u: adreno_cp=0: the command processor is left alone; rbbm_status %#x, cp_protect cntl %#x, "
+		    "protect[0] %#x, protect[26] %#x, protect status %#x, secvid trust %#x, secvid tsb %#x, sqe cntl %#x\n",
+		    step, rd(gpu.base + RBBM_STATUS), rd(gpu.base + CP_PROTECT_CNTL), rd(gpu.base + CP_PROTECT(0)),
+		    rd(gpu.base + CP_PROTECT(26)), rd(gpu.base + CP_PROTECT_STATUS),
+		    rd(gpu.base + RBBM_SECVID_TRUST_CNTL), rd(gpu.base + RBBM_SECVID_TSB_CNTL),
+		    rd(gpu.base + CP_SQE_CNTL));
+		return !space_faulted(&core_space) && !space_faulted(&gmu_space);
+	}
+	/*
+	 * a6xx_patch_pwrup_reglist: the list the command processor is given in its initialize command, so
+	 * that it can put these registers back itself after an IFPC or a preemption. The shape is the
+	 * vendor's: a cpu_gpu_lock of four dwords (its two flags, the turn, and the two halves of one dword
+	 * that say how long the list is and where the preemption-only part of it starts), then for each
+	 * register its dword offset and the value it has now.
+	 */
+	uint64_t pwrup_address = (core_direct ? core_scratch.address : CORE_SCRATCH_ADDRESS) + CORE_PWRUP_AT;
+	{
+		volatile uint32_t *list = (volatile uint32_t *)(core_scratch.memory + CORE_PWRUP_AT);
+		uint32_t entries = sizeof(a650_pwrup_regs) / sizeof(a650_pwrup_regs[0]);
+
+		list[0] = 0;                            /* flag_ucode: the processor's own */
+		list[1] = 0;                            /* flag_kmd: the driver's */
+		list[2] = 0;                            /* turn */
+		list[3] = 2 * entries | 2 * 36u << 16;  /* list_length in dwords, and the IFPC-only part of it (36) */
+		for (uint32_t i = 0; i < entries; i++) {
+			list[4 + 2 * i] = a650_pwrup_regs[i];
+			list[5 + 2 * i] = rd(gpu.base + GPU_WORD(a650_pwrup_regs[i]));
+		}
+		to_memory(core_scratch.memory + CORE_PWRUP_AT, 4 * (4 + 2 * entries));
+		printf("adreno: %u: the command processor's power-up list: %u registers at %#llx\n", step, entries,
+		    pwrup_address);
+	}
+	if (!gx_on) {
+		/*
+		 * The command processor lives in the 3D core's own power domain: starting it with that domain
+		 * off is what the machine has been dying on. Leave it alone and say why, so that the run ends
+		 * with a log instead of with a reset.
+		 */
+		printf("adreno: %u: the 3D core has no power (status %#x, gx_gdscr %#x): the command processor is NOT started\n",
+		    step, rd(gmu.base + GMU_SPTPRAC_PWR_CLK_STATUS), rd(gpucc.base + GPUCC_GX_GDSCR));
+		return false;
+	}
+	/*
+	 * The processor's first command goes into the ring before it is started, the way the lmi port
+	 * does it (tools/lmi-gpu-cp.c): the ring already holds the initialize packet, CP_SQE_CNTL is
+	 * then set to 1, and the write pointer is given last. Starting first and putting the packet in
+	 * afterwards, as this driver did, makes the first fetch race the ring.
+	 * adreno_meinit=8 is the lmi/vendor form (mask 0x2f); 11 is the earlier form with the
+	 * operation mode and the power-up list, kept for a run that compares them.
+	 */
+	uint32_t meinit = 8;
+	PE_parse_boot_argn("adreno_meinit", &meinit, sizeof(meinit));
+	if (meinit != 11) {
+		meinit = 8;
+	}
+	announce("put the command processor's initialize command in the ring before it is started");
+	ring_command(CP_ME_INIT, meinit);
+	if (meinit == 11) {
+		ring(0x0000016f);
+		ring(0x00000003);
+		ring(0x20000000);
+		ring(0);
+		ring(0);
+		ring(0);
+		ring(0x00000002);
+		ring((uint32_t)pwrup_address);
+		ring((uint32_t)(pwrup_address >> 32));
+		ring(0);
+		ring(0);
+	} else {
+		ring(0x0000002f);               /* the ordinals the vendor asks for */
+		ring(0x00000003);               /* several hardware contexts */
+		ring(0x20000000);               /* error detection */
+		for (int i = 0; i < 5; i++) {
+			ring(0);
+		}
+	}
+	ring_send();                            /* the words out to memory; the processor is still halted */
+	uint32_t init_at = ring_at;
+	printf("adreno: %u: the initialize command is in the ring up to word %u (%u words after its header)\n", step,
+	    init_at, meinit);
 	announce(blind ? "start the 3D core's command processor with its microcode nowhere" :
 	    "start the 3D core's command processor");
 	core_runs = true;
@@ -3199,24 +3720,38 @@ step_core_start(void)
 	if (space_faulted(&core_space)) {
 		return false;
 	}
+	/*
+	 * The write pointer last, then wait for the processor to take the command: CP_RB_RPTR reaches
+	 * the pointer's value and RBBM_STATUS' bits other than its least one are clear. This is the lmi
+	 * port's completion test (tools/lmi-gpu-cp.c, lmi_gpu_cp_complete); a processor that never runs
+	 * the microcode leaves the read pointer behind and is reported instead of being assumed to work.
+	 */
+	if (sqe) {
+		uint32_t rptr_now = 0, status_now = 0;
 
-	announce("give the 3D core its first command, \"initialize\"");
-	ring_command(CP_ME_INIT, 8);            /* a6xx_cp_init */
-	ring(0x0000002f);
-	ring(0x00000003);                       /* several hardware contexts */
-	ring(0x20000000);                       /* error detection */
-	ring(0);
-	ring(0);
-	ring(0);
-	ring(0);
-	ring(0);
-	if (!ring_run("initialize its command processor")) {
-		return false;
+		put(&gpu, "cp_rb_wptr (the initialize command)", CP_RB_WPTR, init_at);
+		for (int i = 0; i < 2000; i++) {
+			rptr_now = rd(gpu.base + CP_RB_RPTR);
+			status_now = rd(gpu.base + RBBM_STATUS);
+			if (rptr_now == init_at && (status_now & ~1u) == 0) {
+				break;
+			}
+			sleep_ms(1);
+		}
+		printf("adreno: %u: the command processor %s the initialize command: rptr %u (want %u), rbbm_status %#x\n",
+		    step, rptr_now == init_at && (status_now & ~1u) == 0 ? "TOOK" : "DID NOT TAKE", rptr_now, init_at,
+		    status_now);
+		if (rptr_now != init_at || (status_now & ~1u) != 0) {
+			return false;
+		}
 	}
-	if (oob) {
-		/* the GMU may take the GPU's power in hand again now that the command processor runs */
-		put(&gmu, "host2gmu_intr_set", GMU_WORD(0x5194), 1u << (oob == 2 ? 24 : 31));
-	}
+	/*
+	 * Linux's DRM driver writes RBBM_SECVID_TRUST_CNTL = 0 here; on this phone that write never comes
+	 * back (adreno_trust=1 showed it: the read works, the write does not), and the vendor's own driver
+	 * (kgsl) does not make it at all -- it leaves the core in the secure state and leaves secure mode
+	 * later, on command (step 21). The OOB request is deliberately not released: UniXNU's working probe
+	 * holds it until reset so that no IFPC collapse can take the command processor's state away.
+	 */
 	printf("adreno: %u: THE 3D CORE TAKES COMMANDS\n", step);
 	return true;
 }
