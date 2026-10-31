@@ -73,8 +73,12 @@ else
 fi
 
 say "firmware (rebuild input; not needed for this boot)"
-if [ "${SKIP_FIRMWARE:-0}" = 1 ]; then
-	echo "skipped (SKIP_FIRMWARE=1)"
+# Firmware is the input of rebuilding system.apfs, never of booting: a run boots the loader, the
+# payload and (for the full desktop) the system image that ships with the package. Downloading
+# 5.74 GB of it at every run costs minutes and reads the network for nothing, so it is off unless
+# asked for (FIRMWARE=1) or the images are missing and a rebuild is the only way.
+if [ "${SKIP_FIRMWARE:-1}" = 1 ]; then
+	echo "skipped (default; FIRMWARE=1 to fetch the 5.74 GB rebuild input)"
 elif [ -f "$ROOT/fetch-firmware.sh" ]; then
 	if ! bash "$ROOT/fetch-firmware.sh"; then
 		echo "boot-one: 固件缺失/校验失败，不影响本次启动，继续。" >&2
@@ -84,37 +88,66 @@ else
 fi
 
 say "phone state"
-adb devices | tail -3
-if [ -z "$SERIAL" ]; then
-	# more than one device makes "adb reboot bootloader" fail ("more than one device/emulator"),
-	# and the phone then stays in Android while the fastboot loop runs -- pick the one device.
-	serials=$(adb devices | awk '$2 == "device" { print $1 }')
-	count=$(printf '%s\n' "$serials" | grep -c .)
-	if [ "$count" -ne 1 ]; then
-		echo "boot-one: expected one Android device, found $count: $(echo $serials); set SERIAL=<serial>" >&2
-		exit 1
+# Where the phone is now decides where this run starts, so that a run interrupted halfway does not
+# have to begin again from Android. Android answers adb; the phone's own bootloader answers fastboot
+# with its own product; the loader answers fastboot as xnuloader. What cannot be resumed is a kernel
+# that is already running: it holds the whole machine, and only its own end (REBOOT=1) or a power
+# cycle gives the machine back.
+state=none
+if adb devices 2>/dev/null | awk '$2=="device"{print $1}' | grep -q .; then
+	state=android
+elif fb devices 2>/dev/null | grep -q fastboot; then
+	if fb getvar product 2>&1 | grep -q "product: *xnuloader"; then
+		state=xnuloader
+	else
+		state=bootloader
 	fi
-	SERIAL=$serials
 fi
-echo "serial: $SERIAL"
-ADB="adb -s $SERIAL"
-$ADB shell true >/dev/null 2>&1 || { echo "boot-one: $SERIAL is not answering adb" >&2; exit 1; }
+echo "state: $state"
 
-say "to the bootloader"
-$ADB reboot bootloader >/dev/null 2>&1
-fbdev=
-for i in $(seq 1 30); do
-	if fb devices 2>/dev/null | grep -q fastboot; then fbdev=1; break; fi
-	sleep 1
-done
-if [ -z "$fbdev" ]; then
-	echo "boot-one: $SERIAL never reached the bootloader (still in Android); giving up instead of hanging" >&2
+case $state in
+android)
+	if [ -z "$SERIAL" ]; then
+		# more than one device makes "adb reboot bootloader" fail ("more than one device/emulator"),
+		# and the phone then stays in Android while the fastboot loop runs -- pick the one device.
+		serials=$(adb devices | awk '$2 == "device" { print $1 }')
+		count=$(printf '%s\n' "$serials" | grep -c .)
+		if [ "$count" -ne 1 ]; then
+			echo "boot-one: expected one Android device, found $count: $(echo $serials); set SERIAL=<serial>" >&2
+			exit 1
+		fi
+		SERIAL=$serials
+	fi
+	echo "serial: $SERIAL"
+	ADB="adb -s $SERIAL"
+	$ADB shell true >/dev/null 2>&1 || { echo "boot-one: $SERIAL is not answering adb" >&2; exit 1; }
+	say "to the bootloader"
+	$ADB reboot bootloader >/dev/null 2>&1
+	fbdev=
+	for i in $(seq 1 30); do
+		if fb devices 2>/dev/null | grep -q fastboot; then fbdev=1; break; fi
+		sleep 1
+	done
+	[ -n "$fbdev" ] || { echo "boot-one: never reached the bootloader; giving up instead of hanging" >&2; exit 1; }
+	fb devices | tail -1
+	;;
+bootloader)
+	echo "already in the bootloader; skipping the reboot from Android"
+	;;
+xnuloader)
+	echo "the loader is already up; skipping fastboot boot"
+	;;
+none)
+	echo "boot-one: the phone answers neither adb nor fastboot -- a kernel that is already running" >&2
+	echo "boot-one: holds the machine. Power-cycle the phone and start again." >&2
 	exit 1
-fi
-fb devices | tail -1
+	;;
+esac
 
 say "boot the loader (fastboot boot: RAM only)"
-fb boot "$IMG" 2>&1 | tail -2
+if [ "$state" != xnuloader ]; then
+	fb boot "$IMG" 2>&1 | tail -2
+fi
 up=
 for i in $(seq 1 40); do
 	if fb getvar product 2>&1 | grep -q "product: *xnuloader"; then up=1; break; fi
