@@ -12,3 +12,6 @@ boot/system.apfs
 .DS_Store
 Thumbs.db
 *.swp
+
+# 本地镜像备份
+*.bak*

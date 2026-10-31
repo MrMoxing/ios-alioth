@@ -1,0 +1,72 @@
+== XNULOADER run (usb) ==
+payload entry 'kernel' size e7a070
+payload entry 'ramdisk' size 400000
+payload entry 'cmdline' size ac
+kernel va fffffff007004000..fffffff008262070 entry fffffff0074494a8
+largest free block f4000000 size 18c000000
+phys window f4000000 size 180000000, claim status 0
+kernel loaded at pa f7004000..f8264000
+ramdisk at pa f8264000 size 400000
+return slot patched at f744a7f0, checkpoint 0
+cores for the kernel, in the order it takes them: 700 600 500 400 300 200 100
+device tree f8664000 len 4404, boot_args f8674000, top f8678000
+cmdline: debug=0x8 rd=md0 loader_return_after=200 epoch=1792659000 sb_delay=8 touchscreen=1 buttons=1 touch_stat=5 cpufreq=1 bootcpu=7 cpus=8 adreno_soc=a650 adreno=22 adreno_watch=10 adreno_rptr=0
+the kernel will run on core 700 (this is core 0)
+jumping to f74494a8
+log: 4096 bytes written to logdump (0), read back the same (0)
+core 700: the firmware answers 0 to the request to start it
+log: 4096 bytes written to logdump (0), read back the same (0)
+2 s: the kernel has logged 40204 bytes, heartbeat 1; the last of it:
+dreno: step 20: start the 3D core's command processor
+adreno: 20: before the start: sptprac control 0, status 0, hfi status 0x1
+adreno: 20: still here 500 ms into the pause before the start: rbbm_status 0x800005, sptprac 0, gmu2host intr 0
+
+log: 4096 bytes written to logdump (0), read back the same (0)
+4 s: the kernel has logged 40656 bytes, heartbeat 1; the last of it:
+u2host intr 0
+adreno: 20: still here 2000 ms into the pause before the start: rbbm_status 0x800005, sptprac 0, gmu2host intr 0
+adreno: 20: still here 2500 ms into the pause before the start: rbbm_status 0x800005, sptprac 0, gmu2host intr 0
+
+log: 4096 bytes written to logdump (0), read back the same (0)
+6 s: the kernel has logged 42397 bytes, heartbeat 1; the last of it:
+E WRITES OUR MEMORY ON COMMAND
+adreno: step 21: done
+adreno: 22: the GPU block's register bus clock (ahb) measures 48301856 Hz
+adreno: step 22: make a picture's worth of memory for the 3D core (10 MB) and have it fill three bands of colour
+
+log: 4096 bytes written to logdump (0), read back the same (0)
+8 s: the kernel has logged 43349 bytes, heartbeat 1; the last of it:
+ the middle ff ff ff ff, one in the last row ff 80 00 ff
+adreno: 22: A PICTURE DRAWN BY THE GPU IS ON THE PANEL: orange, white, blue from the top
+adreno: step 22: done
+adreno: alive 1 s after step 22; step 22 had the 3D core fill a picture
+
+log: 4096 bytes written to logdump (0), read back the same (0)
+10 s: the kernel has logged 43493 bytes, heartbeat 1; the last of it:
+p
+adreno: step 22: done
+adreno: alive 1 s after step 22; step 22 had the 3D core fill a picture
+adreno: alive 2 s after step 22; step 22 had the 3D core fill a picture
+adreno: alive 3 s after step 22; step 22 had the 3D core fill a picture
+
+log: 4096 bytes written to logdump (0), read back the same (0)
+12 s: the kernel has logged 44049 bytes, heartbeat 2; the last of it:
+s power-on block: the transfer was dropped
+focaltech: so far 125 reports in 125 looks (0 bad), 0 finger positions, the last at 0, 0; interrupt line high; a report takes 496 us to read; the line looked at every 8000 us, reports 240 a second
+
+log: 4096 bytes written to logdump (0), read back the same (0)
+14 s: the kernel has logged 44193 bytes, heartbeat 2; the last of it:
+ine high; a report takes 496 us to read; the line looked at every 8000 us, reports 240 a second
+adreno: alive 6 s after step 22; step 22 had the 3D core fill a picture
+adreno: alive 7 s after step 22; step 22 had the 3D core fill a picture
+
+log: 4096 bytes written to logdump (0), read back the same (0)
+16 s: the kernel has logged 44337 bytes, heartbeat 2; the last of it:
+ 3D core fill a picture
+adreno: alive 7 s after step 22; step 22 had the 3D core fill a picture
+adreno: alive 8 s after step 22; step 22 had the 3D core fill a picture
+adreno: alive 9 s after step 22; step 22 had the 3D core fill a picture
+
+log: 4096 bytes written to logdump (0), read back the same (0)
+kernel returned: log at f7b349c0, 129789 bytes
+log: 135168 bytes written to logdump (0), read back the same (0)

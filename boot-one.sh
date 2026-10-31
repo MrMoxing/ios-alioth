@@ -23,17 +23,29 @@ for p in "/d/Android/Sdk/platform-tools" "$LOCALAPPDATA/Android/Sdk/platform-too
 done
 export MSYS_NO_PATHCONV=1
 
+# Paths handed to fastboot must be Windows ones: fastboot.exe is a Windows program and this script
+# turns MSYS path conversion off above (MSYS_NO_PATHCONV=1) so that arguments like "0x1000" survive.
+# A path this script computes itself is a /e/... one, which fastboot cannot open -- convert it, and
+# leave an already-Windows path alone so overriding with IMG=C:/... still works.
+winpath() {
+	case "$1" in
+	[A-Za-z]:[\\/]*) printf '%s' "$1" ;;
+	*) cygpath -w "$1" 2>/dev/null || printf '%s' "$1" ;;
+	esac
+}
+
 SECS=${SECS:-45}
 SHOTS=${SHOTS:-3}
 GAP=${GAP:-5}
-IMG=${IMG:-$BOOT/alioth-boot.img}
-SYS=${SYS-$BOOT/system.apfs}     # SYS= (set but empty) means none; ${SYS:-...} would not allow that
-PAYLOAD=${PAYLOAD:-$BOOT/run-payload.bin}
+IMG=${IMG:-$(winpath "$BOOT/alioth-boot.img")}
+SYS=${SYS-$(winpath "$BOOT/system.apfs")}   # SYS= (set but empty) means none
+PAYLOAD=${PAYLOAD:-$(winpath "$BOOT/run-payload.bin")}
 TAG=${TAG:-run$(date +%H%M%S)}
 SERIAL=${SERIAL:-}
 OUT=${OUT:-$ROOT/runs}
 mkdir -p "$OUT"
 LOG=$OUT/$TAG.log
+LOGW=$(winpath "$LOG")      # fastboot writes this one
 RAW=$OUT/$TAG.raw
 PNG=$OUT/$TAG.png
 
@@ -137,14 +149,15 @@ shot() { # shot NAME
 		echo "no screen geometry or no screenshot"
 		return 0
 	fi
-	fb get_staged "$name.raw" >/dev/null 2>&1
+	fb get_staged "$(winpath "$name.raw")" >/dev/null 2>&1
+	[ -s "$name.raw" ] || { sleep 1; fb get_staged "$(winpath "$name.raw")" >/dev/null 2>&1; }
 	[ -s "$name.raw" ] || return 0
 	local python_bin=${PY:-}
 	if [ -z "$python_bin" ]; then
 		python_bin=$(command -v python3 || command -v python || true)
 	fi
 	[ -n "$python_bin" ] || { echo "no python (set PY=/path/to/python)"; return 0; }
-	"$python_bin" - "$name.raw" "$name.png" $geom <<'PY'
+	"$python_bin" - "$(winpath "$name.raw")" "$(winpath "$name.png")" $geom <<'PY'
 import struct, sys, zlib
 raw, out, width, height, stride = sys.argv[1], sys.argv[2], *map(int, sys.argv[3:6])
 data = open(raw, 'rb').read()
@@ -171,13 +184,13 @@ shot "$TAG"
 i=1
 while [ "$i" -lt "$SHOTS" ]; do
 	sleep "$GAP"
-	shot "$TAG-$i"
+	shot "$OUT/$TAG-$i"
 	i=$((i + 1))
 done
 
 say "log"
 fb oem log 2>&1 | tail -1
-fb get_staged "$LOG" >/dev/null 2>&1
+fb get_staged "$LOGW" >/dev/null 2>&1
 if [ -s "$LOG" ]; then
 	tr -d '\0' < "$LOG" > "$LOG.txt"
 	echo "log: $LOG.txt ($(wc -c < "$LOG.txt") bytes)"
