@@ -20,19 +20,23 @@
  *   slv_q2a_axi), the phy's own two clocks at 0x6f004 and 0x6f02c, the bus clock at 0x9000c,
  *   and the two block resets 0x6b000 (core) and 0x6c01c (phy).
  *
- * The steps are how this is to be found out, and one that fails says so and stops the sequence:
- *   1  reads   what the boot loader and Android left of all of that: the power switch, the clock
- *              votes and their halt state, the two resets, the PHY's status word -- and, only if
- *              the controller is actually on, a few of its own registers (reading them while its
- *              clocks are off is a bus access that never returns)
- *   2  writes  the controller's power and clocks on and its two resets out, then reads it back
- *   3  writes  the PHY's own sequence (the device tree's qcom,phy-sequence) and asks it for the
- *              "ready" bit
- *   4  writes  the endpoint's reset line out (TLMM gpio 79) and waits for the link to come up
- *   5  reads   the configuration space: the root complex's and the QCA6390's vendor and device
+ * The steps are how this is to be found out, in the order the vendor driver takes them, and one that
+ * fails says so and stops the sequence (the table of them is at the bottom of this file):
+ *   1  reads   what the boot loader and Android left: the power switch, the clock votes and their halt
+ *              state, the resets, the PHY's status word, and the endpoint's reset line (PERST)
+ *   2-3  assert PERST (the endpoint held in reset), switch the controller's own power on and vote for
+ *              its six clocks
+ *   4  switches the aux clock's source generator on (the wrapper's own register access depends on it)
+ *   5  the vendor's register writes: the core reset, root-complex mode, the reference generator, the DBI
+ *              base (0x350: this IP revision's offset), the system and power-management words, the NoC
+ *              clocks, the MHI clock reset
+ *   6-7  the PHY: its auxiliary clock, its power-down word, its 99 pairs, its ready bit
+ *   8-9  read the whole clock corner, then the wrapper's registers
+ *   10 reads   the core's own windows: configuration space, address translator, DBI, ELBI
+ *   11 release PERST, turn the link training state machine on and see whether the core moves its state
  *
- * Boot-arg pcie=N performs steps 1 to N and stops; pcie_pause=MS is how long a step waits after
- * announcing a group of accesses (default 2200, as the loader notes the log every two seconds).
+ * Boot-arg pcie=N performs steps 1 to N and stops (pcie_skip=MASK leaves out steps by 1<<N);
+ * pcie_pause=MS is how long a step waits after announcing a group of accesses (default 2200).
  */
 #include <kern/clock.h>
 #include <kern/thread.h>
@@ -53,11 +57,18 @@ static uint32_t pcie_skip_steps;
 
 static void run_steps(void);
 static void pcie_steps_thread(void *argument, wait_result_t wait_result);
+static void line(const char *fmt, ...);
 
 static void
 sleep_ms(uint32_t ms)
 {
 	delay_for_interval(ms, NSEC_PER_MSEC);
+}
+
+static void
+sleep_us(uint32_t us)
+{
+	delay_for_interval(us, NSEC_PER_USEC);
 }
 
 static void
@@ -71,7 +82,7 @@ pause_group(void)
 	}
 }
 
-#define BLOCK_NAMES 7
+#define BLOCK_NAMES 8
 static struct {
 	const char *name;
 	uint64_t base;
@@ -85,6 +96,7 @@ static struct {
 	{ "iatu", 0x60001000, 0x1000 },
 	{ "conf", 0x60100000, 0x100000 },
 	{ "dbi", 0x60000000, 0x1000 },   /* the core's own 4 KB: DBI at its start, ELBI at 0xf20 */
+	{ "tlmm-north", 0x0f900000, 0x90000 },  /* gpio79 (PERST) is in the north tile: 0x1000 * 79 */
 };
 
 static uint64_t
@@ -108,6 +120,44 @@ wr(uint64_t address, uint32_t value)
 	if (address) {
 		*(volatile uint32_t *)address = value;
 	}
+}
+
+/*
+ * PERST: the endpoint's reset line is TLMM gpio 79, in the north tile (pinctrl-kona.c: north is
+ * 0x0f900000 and a pin's registers are at tile + 0x1000 * pin). Its registers are the msm layout:
+ * CTL holds pull [1:0], function [5:2], drive [8:6] and the output-enable bit 9; IO holds the input
+ * (bit 0) and the output level (bit 1). The device tree asks for the line active high in the pin flags,
+ * but the vendor driver's table has perst on = 0 -- asserted is a low level, released a high one.
+ */
+#define PERST_GPIO              79
+#define PERST_CFG               (reg(7, 0x1000UL * PERST_GPIO))
+#define PERST_IO                (reg(7, 0x1000UL * PERST_GPIO + 4))
+#define PERST_CTL_MASK          ((0xfu << 2) | 3u | (7u << 6) | (1u << 9))
+
+static void
+perst_set(bool high)
+{
+	wr(PERST_IO, high ? 2 : 0);     /* the level first; the pin must never drive the wrong one */
+}
+
+/* Hold the endpoint in reset: drive it low, then make the pin an output (gpio mode, 4 mA). */
+static void
+perst_assert(void)
+{
+	uint32_t cfg = rd(PERST_CFG), io = rd(PERST_IO);
+
+	line("PERST (gpio79, north) before: cfg %#x, io %#x", cfg, io);
+	perst_set(false);
+	wr(PERST_CFG, (cfg & ~PERST_CTL_MASK) | (1u << 6) | (1u << 9));
+	line("PERST asserted (low): cfg %#x, io %#x", rd(PERST_CFG), rd(PERST_IO));
+}
+
+/* Bring the endpoint out of reset: drive it high. */
+static void
+perst_release(void)
+{
+	perst_set(true);
+	line("PERST released (high): io %#x", rd(PERST_IO));
 }
 
 static void
@@ -189,6 +239,78 @@ put(int which, const char *name, uint32_t offset, uint32_t value)
 /* Where the clock controller's registers are, as an address (its block base plus the offset). */
 #define GCC(off)                reg(0, (off))
 
+/*
+ * The SoC's own clock measure (the vendor's clk-debug.c; the GPU driver here uses the same registers):
+ * one of the clock controller's clocks is put on a debug output, the global counter counts it against
+ * the crystal divided by four, and the count over a known number of those ticks is the rate. The
+ * numbers that name each clock are from the vendor's debugcc-kona.c.
+ */
+#define GCC_DEBUG_MUX           0x62000         /* [9:0] which clock */
+#define GCC_DEBUG_DIV           0x62004         /* [3:0] divider - 1: this path divides by two */
+#define GCC_DEBUG_CBCR          0x62008
+#define GCC_MEASURE_CTL         0x62038
+#define GCC_MEASURE_STATUS      0x6203c
+#define GCC_XO_DIV4_CBCR        0x4300c
+#define MEASURE_RUN             (1u << 20)
+#define MEASURE_CLEAR           (1u << 21)
+#define MEASURE_DONE            (1u << 25)
+#define MEASURE_FULL            0x20000u
+#define MEASURE_FAILED          0xffffffffu
+
+#define CLK_CPUSS_AHB           0x0e0           /* a clock that is certainly running: the control */
+#define CLK_PCIE0_PIPE          0x0f7
+#define CLK_PCIE0_AUX           0x0f6
+#define CLK_PCIE0_CFG_AHB       0x0f5
+#define CLK_PCIE0_MSTR_AXI      0x0f4
+#define CLK_PCIE0_SLV_AXI       0x0f3
+#define CLK_PCIE_PHY_AUX        0x102
+
+static uint32_t
+count_ticks(uint32_t ticks)
+{
+	uint32_t control = rd(GCC(GCC_MEASURE_CTL)) & ~(MEASURE_RUN | MEASURE_CLEAR | 0xfffffu);
+	uint32_t status = 0;
+
+	wr(GCC(GCC_MEASURE_CTL), control | MEASURE_CLEAR);
+	sleep_us(10);
+	wr(GCC(GCC_MEASURE_CTL), control | ticks);
+	wr(GCC(GCC_MEASURE_CTL), control | ticks | MEASURE_RUN);
+	for (int i = 0; i < 2000 && !(status & MEASURE_DONE); i++) {
+		sleep_us(100);
+		status = rd(GCC(GCC_MEASURE_STATUS));
+	}
+	wr(GCC(GCC_MEASURE_CTL), control);
+	return (status & MEASURE_DONE) ? (status & 0x1ffffff) : MEASURE_FAILED;
+}
+
+/* The rate in Hz of one of the clock controller's clocks; 0 if it does not run. Everything is put back. */
+static uint32_t
+measure_gcc_clock(uint32_t select)
+{
+	uint32_t mux = rd(GCC(GCC_DEBUG_MUX)), div = rd(GCC(GCC_DEBUG_DIV)), cbcr = rd(GCC(GCC_DEBUG_CBCR));
+	uint32_t base = rd(GCC(GCC_XO_DIV4_CBCR)), brief, full;
+
+	wr(GCC(GCC_DEBUG_MUX), (mux & ~0x3ffu) | select);
+	wr(GCC(GCC_DEBUG_DIV), (div & ~0xfu) | 1u);
+	wr(GCC(GCC_DEBUG_CBCR), cbcr | 1u);
+	wr(GCC(GCC_XO_DIV4_CBCR), base | 1u);
+	/* a counter whose input stands still keeps its last count: the two counts differ only if it runs */
+	brief = count_ticks(0x1000);
+	full = brief == MEASURE_FAILED ? MEASURE_FAILED : count_ticks(MEASURE_FULL);
+	wr(GCC(GCC_XO_DIV4_CBCR), base);
+	wr(GCC(GCC_DEBUG_CBCR), cbcr);
+	wr(GCC(GCC_DEBUG_DIV), div);
+	wr(GCC(GCC_DEBUG_MUX), mux);
+	if (full == MEASURE_FAILED) {
+		return MEASURE_FAILED;
+	}
+	if (full == brief) {
+		return 0;
+	}
+	/* the crystal over four is the time base; the divider on the way to the counter is two */
+	return (uint32_t)(((uint64_t)full * 4800000 * 2) / MEASURE_FULL);
+}
+
 static bool
 map_all(void)
 {
@@ -228,7 +350,14 @@ map_all(void)
 #define PHY_POWER_DOWN          0x840           /* dt: qcom,phy-power-down-offset */
 
 #define GDSC_PWR_ON             (1u << 31)      /* gdsc.c: PWR_ON_MASK */
-#define CLOCK_VOTES             0x2fu           /* slv_axi, mstr_axi, cfg_ahb, aux, slv_q2a (pipe comes with the PHY) */
+/*
+ * Every branch in gcc_pcie_0_axi_clk_misc (gcc-sm8250.c): bit 0 slv_axi, 1 mstr_axi, 2 cfg_ahb, 3 aux,
+ * 4 pipe, 5 slv_q2a. Bit 4 is the one the core itself runs on -- it is the PHY's pipe clock coming back
+ * through the controller -- and with it out the core never answered a single register: reads of the DBI,
+ * the address translator and the link block sat there until the machine was reset, while every read of
+ * the wrapper's own PARF block came back.
+ */
+#define CLOCK_VOTES             0x3fu
 
 static bool
 step_look(void)
@@ -262,12 +391,15 @@ step_look(void)
 	get(2, "parf_sys_ctrl", 0x00);
 	get(2, "parf_phy_ctrl", 0x40);
 	get(2, "parf_phy_refclk", 0x4c);
-	get(2, "parf_dbi_base", 0x168);
-	get(2, "parf_slv_addr_space_size", 0x16c);
+	get(2, "parf_dbi_base_v2 (0x350: this IP revision)", 0x350);
+	get(2, "parf_dbi_base_v1 (0x168: what the driver used before)", 0x168);
+	get(2, "parf_slv_addr_space_size_v2", 0x358);
 	get(2, "parf_ltssm", 0x1b0);
 	get(2, "parf_q2a_flush", 0x1ac);
 	get(2, "parf_bdf_translate", 0x24c);
 	get(3, "elbi_sys_ctrl", 0x04);
+	get(7, "perst_gpio79 cfg", 0x1000 * PERST_GPIO);
+	get(7, "perst_gpio79 io", 0x1000 * PERST_GPIO + 4);
 	return true;
 }
 
@@ -276,8 +408,9 @@ step_gdsc(void)
 {
 	uint32_t gdscr, waited;
 
-	announce("switch the controller's own power on: the software collapse bit out of its power switch, then wait for its "
-	    "power-on bit");
+	announce("hold the endpoint in reset (PERST low), switch the controller's own power on: the software collapse bit "
+	    "out of its power switch, then wait for its power-on bit");
+	perst_assert();
 	gdscr = get(0, "pcie_0_gdscr", GCC_PCIE_0_GDSCR);
 	put(0, "pcie_0_gdscr", GCC_PCIE_0_GDSCR, gdscr & ~GDSC_SW_COLLAPSE);
 	for (waited = 0; waited < 100; waited++) {
@@ -298,8 +431,7 @@ step_gdsc(void)
 static bool
 step_clocks(void)
 {
-	announce("vote for its clocks (slv_axi, mstr_axi, cfg_ahb, aux, slv_q2a; the pipe clock comes with the PHY) and read "
-	    "the halt state of each");
+	announce("vote for its clocks (slv_axi, mstr_axi, cfg_ahb, aux, pipe, slv_q2a) and read the halt state of each");
 	put(0, "pcie_0_axi_misc (vote for its clocks)", GCC_PCIE_0_AXI_MISC, rd(GCC(GCC_PCIE_0_AXI_MISC)) | CLOCK_VOTES);
 	sleep_ms(1);
 	get(0, "pcie_0_axi_misc after", GCC_PCIE_0_AXI_MISC);
@@ -307,7 +439,18 @@ step_clocks(void)
 	get(0, "pcie_0_mstr_axi_halt", GCC_PCIE_0_MSTR_HALT);
 	get(0, "pcie_0_cfg_ahb_halt", GCC_PCIE_0_CFG_AHB_HALT);
 	get(0, "pcie_0_aux_halt", GCC_PCIE_0_AUX_HALT);
+	get(0, "pcie_0_pipe_halt", GCC_PCIE_0_PIPE_HALT);
 	get(0, "pcie_0_slv_q2a_halt", GCC_PCIE_0_Q2A_AXI_HALT);
+	/*
+	 * The halt registers cannot say whether a clock runs; the SoC can. cpuss_ahb is the control: it is
+	 * certainly running, so if it does not read as a rate the measuring itself is wrong. A zero among the
+	 * PCIe clocks means that clock is not running at all -- for the two AXI clocks that would be the
+	 * NoC behind them, not this controller.
+	 */
+	line("measured: cpuss_ahb %u Hz, pcie slv_axi %u, mstr_axi %u, cfg_ahb %u, aux %u, pipe %u",
+	    measure_gcc_clock(CLK_CPUSS_AHB), measure_gcc_clock(CLK_PCIE0_SLV_AXI),
+	    measure_gcc_clock(CLK_PCIE0_MSTR_AXI), measure_gcc_clock(CLK_PCIE0_CFG_AHB),
+	    measure_gcc_clock(CLK_PCIE0_AUX), measure_gcc_clock(CLK_PCIE0_PIPE));
 	return true;
 }
 
@@ -388,6 +531,17 @@ step_phy_seq(void)
 	put(0, "phy_refgen_src cfg (100 MHz)", 0x6f018, 0x501);
 	put(0, "phy_refgen_src root enable", 0x6f014, 0x2);
 	put(0, "pcie0_phy_refgen again", GCC_PCIE_0_PHY_REFGEN, rd(GCC(GCC_PCIE_0_PHY_REFGEN)) | 1u);
+	/*
+	 * And which reference the PHY takes: PARF_PHY_REFCLK's bit 12 is USE_PAD in mainline's header -- the PHY
+	 * looking for its reference on a pad. This board clocks the PHY from its own reference generator, so the
+	 * bit is cleared before the sequence is written.
+	 */
+	{
+		uint32_t value = get(1, "parf_phy_refclk", 0x4c);
+
+		put(1, "parf_phy_refclk (pad reference off)", 0x4c, value & ~(1u << 12));
+		get(1, "parf_phy_refclk after", 0x4c);
+	}
 	sleep_ms(100);          /* qcom_pcie_phy_power_on() waits before it touches the PHY again */
 	get(0, "pcie_phy_aux after the reset", GCC_PCIE_PHY_AUX);
 	get(0, "pcie_0_phy_bcr after", GCC_PCIE_0_PHY_BCR);
@@ -401,6 +555,11 @@ step_phy_seq(void)
 		wr(reg(2, phy_sequence[i].reg), phy_sequence[i].value);
 	}
 	sleep_ms(10);
+	/* the last two pairs are the start control (0x844) and the word before it: what the PLL was told to do */
+	get(2, "phy_start_control", 0x844);
+	get(2, "phy_800", 0x800);
+	get(2, "phy_9a4", 0x9a4);
+	get(2, "phy_8dc", 0x8dc);
 	{
 		uint32_t status = 0;
 
@@ -457,6 +616,12 @@ step_clocks_dump(void)
 	for (unsigned i = 0; i < sizeof(area) / sizeof(area[0]); i++) {
 		get(0, area[i].name, area[i].offset);
 	}
+	/* now that the PHY is up as well, the same measurement: the pipe clock comes from it */
+	line("measured after the PHY: cpuss_ahb %u Hz, slv_axi %u, mstr_axi %u, cfg_ahb %u, aux %u, pipe %u, phy_aux %u",
+	    measure_gcc_clock(CLK_CPUSS_AHB), measure_gcc_clock(CLK_PCIE0_SLV_AXI),
+	    measure_gcc_clock(CLK_PCIE0_MSTR_AXI), measure_gcc_clock(CLK_PCIE0_CFG_AHB),
+	    measure_gcc_clock(CLK_PCIE0_AUX), measure_gcc_clock(CLK_PCIE0_PIPE),
+	    measure_gcc_clock(CLK_PCIE_PHY_AUX));
 	return true;
 }
 
@@ -493,11 +658,12 @@ step_parf(void)
 	get(1, "parf_sys_ctrl", 0x00);
 	get(1, "parf_phy_ctrl", 0x40);
 	get(1, "parf_phy_refclk", 0x4c);
-	get(1, "parf_dbi_base", 0x168);
-	get(1, "parf_slv_addr_space_size", 0x16c);
+	get(1, "parf_dbi_base_v2 (0x350)", 0x350);
+	get(1, "parf_slv_addr_space_size_v2", 0x358);
 	get(1, "parf_q2a_flush", 0x1ac);
 	get(1, "parf_ltssm", 0x1b0);
 	get(1, "parf_bdf_translate", 0x24c);
+	get(7, "perst_gpio79 io (still asserted)", 0x1000 * PERST_GPIO + 4);
 	return true;
 }
 
@@ -542,17 +708,31 @@ step_parf_init(void)
 
 	value = get(1, "parf_phy_ctrl", 0x40);
 	put(1, "parf_phy_ctrl (bit 0 out)", 0x40, value & ~1u);
-	put(1, "parf_dbi_base (zero)", 0x168, 0);
+	value = get(1, "parf_phy_refclk", 0x4c);
+	put(1, "parf_phy_refclk (pad reference off)", 0x4c, value & ~(1u << 12));
 	/*
-	 * The controller's system control word as a later vendor variant of this init writes it: the master's and
-	 * the slave's AXI clock gating off, and -- this one matters here -- the core clock's gating off too
-	 * (CORE_CLK_CGC_DIS, bit 6), together with the L1 clock removal disable. The word was found with bit 6
-	 * clear, and the core's own registers then never answered.
+	 * The DBI base register's offset depends on the controller's IP revision: 0x168 in the older one,
+	 * 0x350 in this SoC's (the vendor driver's PCIE20_PARF_DBI_BASE_ADDR, and pcie-qcom.c's 2.7.0
+	 * variant). The run before this one wrote the older offset, which on this core lands in another
+	 * register; the vendor sets it to zero at this point in the sequence.
+	 */
+	put(1, "parf_dbi_base_v2 (zero, at 0x350)", 0x350, 0);
+	get(1, "parf_dbi_base_v1 (legacy offset, read only)", 0x168);
+	/*
+	 * Exactly what qcom_pcie_init_2_7_0 -- the variant this SoC uses in mainline -- does with these two:
+	 * bit 29 of the system control word (the MAC's PHY power-down mux) out, and the power management word's
+	 * REQ_NOT_ENTR_L1 (bit 5) out, which allows L1 entry.
 	 */
 	value = get(1, "parf_sys_ctrl", 0x00);
-	put(1, "parf_sys_ctrl (bit 29 out, core clock gating off)", 0x00,
-	    (value & ~(1u << 29)) | (1u << 6) | (1u << 1));
-	put(1, "parf_slv_addr_space_size", 0x358, 0x10000000);
+	put(1, "parf_sys_ctrl (bit 29 out)", 0x00, value & ~(1u << 29));
+	value = get(1, "parf_pm_ctrl", 0x20);
+	put(1, "parf_pm_ctrl (L1 entry allowed)", 0x20, value & ~(1u << 5));
+	/*
+	 * The inbound address space: this phone's device tree gives 0x4000000, and this IP revision keeps
+	 * the size at 0x358 (the older core had it at 0x16c, read only here).
+	 */
+	get(1, "parf_slv_addr_space_size_v1 (legacy offset, read only)", 0x16c);
+	put(1, "parf_slv_addr_space_size_v2", 0x358, 0x4000000);
 	/*
 	 * The two NoC-side clocks the device tree lists besides the six in the vote (clock-names "tbu" and
 	 * "ddrss_sf_tbu"): the first was found voted already, the second not.
@@ -576,30 +756,65 @@ step_parf_init(void)
 static bool
 step_dbi(void)
 {
-	announce("ask the controller's own three windows in the order that tells them apart: the address translator, the "
-	    "configuration space the buses are seen through, the core's own 4 KB, and the link control block");
-	get(4, "iatu_viewport", 0x00);
+	/*
+	 * The configuration space first: it is the one the system would enumerate through, and it is a window of
+	 * its own (0x60100000) rather than part of the core's 4 KB. The address translator and the core's own 4 KB
+	 * follow; the link control block is last, since that is the access the run before this one ended on.
+	 */
+	announce("ask the controller's windows in the order that tells them apart: the configuration space the buses are "
+	    "seen through, the address translator, the core's own 4 KB, and the link control block");
 	get(5, "conf_vendor_device (bus 0, device 0, function 0)", 0x00);
 	get(5, "conf_header_type", 0x0c);
+	get(5, "conf_capability", 0x34);
+	get(4, "iatu_viewport", 0x00);
 	get(6, "dbi_vendor_device", 0x00);
 	get(6, "dbi_capability", 0x70);
 	get(3, "elbi_sys_ctrl", 0x04);
 	return true;
 }
 
+/*
+ * Turn the link training state machine on and look at what the core writes back into the wrapper's own copy
+ * of its state (PARF_LTSSM): if the low bits move, the core is running even though the window it serves never
+ * answered; if they stay where they were, the core itself has no clock or no power.
+ */
+static bool
+step_ltssm(void)
+{
+	uint32_t before, after;
+
+	announce("bring the endpoint out of reset (PERST high), then turn the link training state machine on and see "
+	    "whether the core moves its state");
+	perst_release();
+	sleep_us(1000);         /* the vendor waits a millisecond after the reset line goes up */
+	before = get(1, "parf_ltssm", 0x1b0);
+	put(1, "parf_ltssm (training on)", 0x1b0, before | (1u << 8));
+	sleep_ms(50);
+	after = get(1, "parf_ltssm after", 0x1b0);
+	line("the core's link state %s (before %#x, after %#x)",
+	    ((after ^ before) & 0x1fu) ? "MOVED" : "DID NOT MOVE", before, after);
+	return true;
+}
+
 /* ---- what runs ------------------------------------------------------------------------------ */
 
+/*
+ * In the order the vendor driver's host init takes them: the controller's clocks and its own registers first
+ * (qcom_pcie_init_2_7_0), then the PHY's power-on and its sequence (phy_power_on), then the pipe clock and the
+ * rest -- which is why the PHY steps come after the registers now.
+ */
 static bool (*const steps[])(void) = {
-	step_look,
-	step_gdsc,
-	step_clocks,
-	step_phy,
-	step_phy_seq,
-	step_clocks_dump,
-	step_aux_src,
-	step_parf,
-	step_parf_init,
-	step_dbi,
+	step_look,              /* 1  read what the boot loader and Android left */
+	step_gdsc,              /* 2  the controller's own power switch */
+	step_clocks,            /* 3  the six clock branches in 0x52008 */
+	step_aux_src,           /* 4  the aux clock's source generator (the wrapper's APB clock) */
+	step_parf_init,         /* 5  the vendor's register writes, the core reset, the reference generator */
+	step_phy,               /* 6  the PHY's auxiliary clock and its power-down word */
+	step_phy_seq,           /* 7  the PHY's own 99 pairs and its ready bit */
+	step_clocks_dump,       /* 8  the whole PCIe0 corner of the clock controller */
+	step_parf,              /* 9  the wrapper's registers, once everything above is on */
+	step_dbi,               /* 10 the core's own windows: conf, iATU, DBI, ELBI */
+	step_ltssm,             /* 11 turn the link training state machine on and see if the core moves */
 };
 
 void
