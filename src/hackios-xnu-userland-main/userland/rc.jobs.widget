@@ -1,0 +1,6 @@
+# Commands run by the launchd job com.redwood.demo (see com.redwood.demo.plist).
+# The widget page (RC_JOBS=rc.jobs.widget, gpu=1): wait for SpringBoard, then one rightward swipe
+# that starts inside the home screen (not on the edge, where the system gesture takes it) to reach
+# Today View. Nothing else follows, so the page is left as it landed for the screenshots.
+/redwood/bin/sound_test springboard
+/redwood/bin/rwtouch wait 30 swipe 0.15 0.5 0.95 0.5 400 wait 20

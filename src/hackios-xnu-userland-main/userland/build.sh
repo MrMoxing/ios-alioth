@@ -103,8 +103,16 @@ IOS_JOBS=${JOBS-"
 	com.apple.backboardd com.apple.mobile.usermanagerd com.apple.mobilegestalt.xpc com.apple.lsd
 	com.apple.powerd com.apple.analyticsd com.apple.logd_helper
 	com.apple.iconservices.iconservicesagent com.apple.pluginkit.pkd
-	com.apple.SpringBoard
+	com.apple.SpringBoard com.apple.chronod
 "}
+# com.apple.chronod is what registers com.apple.chronoservices, and without it the home screen's
+# widgets are laid out as blank shapes: SpringBoard asks for that service every time it draws a
+# widget and, with nothing answering, the widget's content is never produced -- the containers and
+# their sizes are right, the inside is empty. Measured on the phone (2026-10-31): without it
+# "failed lookup: name = com.apple.chronoservices, requestor = SpringBoard[7]" and 0 widget
+# extension processes; with it that lookup fails 0 times, seven widget extensions start
+# (CalendarWidget, FitnessWidget, gamecenter.widgets, podcasts.widget...) and Calendar, Weather and
+# Apple News all draw. It also runs the poster/paper machinery the lock screen's wallpaper wants.
 # iOS's own Wi-Fi daemon, for Settings to have a Wi-Fi to show: the kernel answers it in
 # bsd/dev/redwood_apple80211.c. With the radio (wifi=1) Settings then shows Wi-Fi on, the network joined and the
 # networks the radio hears. NOT FINISHED: a network cannot be joined from Settings yet.
