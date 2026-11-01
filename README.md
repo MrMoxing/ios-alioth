@@ -7,12 +7,14 @@
 fastboot boot → Mu-Silicium UEFI → xnuloader (EFI 应用) → XNU → launchd → backboardd → SpringBoard
 ```
 
-**全程只写 RAM**（`fastboot boot` / `fastboot stage`），不写任何分区；重启即回到原来的 Android / HyperOS。
-唯一的写操作是 loader 在内核返回时写小米的 `logdump` 分区（崩溃日志分区，不影响启动）。
+**全程只写 RAM**（`fastboot boot` / `fastboot stage`），不刷任何分区；重启即回到原来的 Android / HyperOS。
+唯一的持久化写操作是 loader 经手机 UFS 的 `darwin` 分区保存数据卷（`var_store`，双槽 2×2 GiB）与
+崩溃时写小米的 `logdump` 分区；两者都不碰系统分区，重启回 Android 不受影响。
 
-- 打包日期：2026-10-23
+- 打包日期：2026-10-31（GPU 用户态渲染通路打通，见 §1 与 [docs/PROJECT-MAP.md](docs/PROJECT-MAP.md)）
 - 真机验证的目标：Redmi K40（alioth），MIUI/HyperOS 原系统保留
-- 详细技术记录见 [docs/SESSION-HANDOFF.md](docs/SESSION-HANDOFF.md)（参数、根因、踩过的坑、GPU/Wi-Fi 进展）
+- 详细技术记录见 [docs/PROJECT-MAP.md](docs/PROJECT-MAP.md)（文件地图、GPU 三条渲染路径、构建配方与坑）、
+  [docs/SESSION-HANDOFF.md](docs/SESSION-HANDOFF.md)（参数、根因、踩过的坑、GPU/Wi-Fi 进展）
 
 ---
 
@@ -26,13 +28,19 @@ fastboot boot → Mu-Silicium UEFI → xnuloader (EFI 应用) → XNU → launch
 | XNU 启动并挂载 APFS 系统卷 | `apfs: volume 0 "System" … 45143 files`、`BSD root: md0` |
 | iOS 用户态完整起来 | `launchd.ios` → `runningboardd` → `backboardd` → `SpringBoard`(pid 7) |
 | **iOS 16.5 主屏显示** | `docs/screenshots/01-springboard.png` |
-| 锁屏 / 程序注入点击 | `02-lock-screen.png`、`03-appstore-by-simulated-tap.png` |
+| **GPU 用户态渲染**（CoreAnimation 走 Adreno） | `docs/evidence/2026-10-31-gpu-switcher.png`；日志 `the server has an accelerated renderer`、`OpenGL ES 3.2 Mesa 25.0.7; FD650` |
+| **小组件出内容**（日历 / 天气 / Apple News） | `docs/evidence/2026-10-31-gpu-widgets-content.png`（此前空白白块） |
+| Dock 半透明材质 / 壁纸模糊 / 主屏编辑模式 | `docs/evidence/2026-10-31-gpu-edit-mode.png` |
+| 应用切换器（多卡片、真实内容） | `docs/evidence/2026-10-31-gpu-switcher.png` |
 | **真实手指触摸**（FT 0x5652） | `docs/screenshots/r6.png`（手指点开「设置」） |
 | 电源键 / 音量键、真实电量 | 见 `docs/SESSION-HANDOFF.md` §5.3–§5.5 |
 | EPSS 三簇调频 1804 / 2419 / 3187 MHz | `docs/evidence/2026-10-22-first-boot-kernel.log` |
+| 数据卷跨启动持久化（`var_store`，2×2 GiB） | `com.redwood.varstore` job；`kern.redwood.ufs_write_bytes` |
 
-**未达成（勿期待）**：GPU 画图（step 20 写 `CP_SQE_CNTL` 触发整机复位）、Wi-Fi（QCA6390）、
-真实音频（`mediaserverd` 未启动）、相机、蜂窝/蓝牙。7 个核里只有 4 个 online。
+**仍未达成（勿期待）**：Wi-Fi（QCA6390，见 §6 表）、真实音频（`mediaserverd` 未启动）、相机、蜂窝/蓝牙；
+**真熄屏**（电源键目前是画黑帧，面板仍通电——AMOLED 需 DSI 命令，见 §6）；系统默认壁纸
+（iOS 16 的壁纸由 PosterBoard 程序化渲染，见 §6）；存储显示（仍报 2 GB / 0，见 §6）；系统语言（默认仍英文，
+中文种子在开发分支尚未生效）；7 个核里只有 4 个 online。
 
 ---
 
@@ -42,12 +50,13 @@ fastboot boot → Mu-Silicium UEFI → xnuloader (EFI 应用) → XNU → launch
 ios-alioth/
 ├── boot-one.bat                一键启动（Windows 入口，双击或命令行；不需要 Git Bash/Python）
 ├── boot-one.ps1                boot-one.bat 的实现（.NET 截图转换、超时控制）
-├── boot-one.sh                 一键启动（Git Bash；输出写到 runs/）
+├── boot-one.sh                 一键启动（Git Bash；按设备状态续跑：Android / bootloader / xnuloader）
 ├── fetch-firmware.bat          固件获取（Windows 入口）
 ├── fetch-firmware.ps1          fetch-firmware.bat 的实现（断点续传 + 大小/MD5）
 ├── fetch-firmware.sh           固件获取（Git Bash；断点续传 + 大小/MD5）
+├── ubuntu/                     Linux 构建入口：sync.sh 组装工作树、build.sh 一键构建、README
 ├── runs/                       运行产物（首次运行自动创建）：runHHMMSS.png / .log.txt
-├── firmware/                   本地固件目录（**不入库**）：iOS 16.5 IPSW，缺失时自动下载
+├── firmware/                   本地固件目录（**不入库**）：iOS 16.5 IPSW，仅重建系统卷时需要（默认不下载）
 │   ├── iPhone10,3,iPhone10,6_16.5_20F66_Restore.ipsw
 │   ├── iPhone10,3,iPhone10,6_16.5_20F66_Restore.ipsw.md5   基准 MD5
 │   └── .verified               校验通过标记（脚本快速路径）
@@ -56,9 +65,9 @@ ios-alioth/
 │   ├── uefi-alioth.fd          同一份 UEFI 的裸 FD（3 MB，调试/替换用）
 │   ├── run-payload.bin         XNUP 载荷：内核 + root.apfs + 完整 cmdline（fastboot stage 用）
 │   ├── system.apfs             iOS 16.5 系统卷（2.49 GB，**不入库**：GitHub 单文件 100 MB 限制；本地按 §5.4 构建）
-│   ├── root.apfs               启动卷 4 MB：init / 注入库 / GPU 固件 / launchd jobs
+│   ├── root.apfs               启动卷 10.4 MB：init / 注入库 / **GL 库（libOSMesa + libredwood-gl + libredwoodair）** / GPU 固件 / launchd jobs（含 chronod）
 │   ├── kernel-ios.bin          当前载荷里那份内核（与 run-payload.bin 内嵌的一致，重建载荷用）
-│   ├── kernel-latest.bin       2026-10-23 最新源码构建的内核（含 PCIe 分步调试代码，`pcie=N` 才生效）
+│   ├── kernel-latest.bin       2026-10-31 源码构建的内核（含 GPU step 20 修复，即真机验证通过的那份）
 │   └── inspect_payload.py      打印载荷里的 cmdline 与各段长度/MD5
 ├── src/
 │   ├── hackios-xnu-kernel-main/   内核工程（上游 fork + alioth 移植改动、xnuloader、UEFI、Wi-Fi 兼容层）
@@ -66,9 +75,11 @@ ios-alioth/
 │   ├── mu-silicium-config/        Mu-Silicium 的 alioth 设备配置（alioth.toml / DeviceBuild.py / build_uefi.py / alioth.dts）
 │   └── tools/                     fdt_dump.py（纯 Python FDT 解析）
 ├── docs/
+│   ├── PROJECT-MAP.md           项目地图：每个文件的用途、GPU 三条渲染路径、构建配方与坑（先看这个）
 │   ├── PROJECT-README.md        工作区原始说明
 │   ├── SESSION-HANDOFF.md       完整交接文档：参数、根因、排除记录、GPU/Wi-Fi 进展
-│   ├── evidence/                2026-10-22 真机原始日志（5 份）
+│   ├── unixnu-fft-gpu-ufs.md    与 FFT-infra/UniXNU-alioth 的修复对照
+│   ├── evidence/                真机原始日志与截图（2026-10-22 起，含 GPU 打通的逐轮证据）
 │   ├── screenshots/             主屏 / 锁屏 / 注入点击 / 真实触摸
 │   └── hardware/alioth.dts      从真机导出的设备树（1.5 MB）
 ├── tools/                       symbolize.py（panic 地址反查）、pngcrop.py（帧缓冲裁剪）、dump-gpu.sh、pci-topology.sh
@@ -107,9 +118,12 @@ cd <交付包路径>/open-source
 SECS=45 SHOTS=3 GAP=5 bash boot-one.sh
 ```
 
-`.bat` 与 `.sh` 流程完全一致：进 bootloader → `fastboot boot boot\alioth-boot.img` → 等 `product: xnuloader` →
-`fastboot oem ramdisk` → `fastboot stage boot\system.apfs`（2.49 GB，约 1.5 分钟）→ `fastboot stage boot\run-payload.bin` →
-`fastboot oem run` → 等 `Secs` 秒 → 连拍截图（间隔 `Gap`）→ 取日志 → **留在 iOS**（不回安卓）。
+`.bat` 与 `.sh` 流程完全一致：**先探测设备当前状态，从所处状态继续**——
+在 Android（adb）→ 重启进 bootloader；已在 bootloader → 直接 boot；
+loader 已在跑（`product: xnuloader`）→ 跳过 boot 直接续跑后续步骤。
+之后：`fastboot oem ramdisk` → `fastboot stage boot\system.apfs`（2.49 GB，约 1.5 分钟）→
+`fastboot stage boot\run-payload.bin` → `fastboot oem run` → 等 `Secs` 秒 → 连拍截图（间隔 `Gap`）→
+取日志 → **留在 iOS**（不回安卓）。中途断了不用重启到安卓：脚本会从当前状态接着跑。
 
 **产物**：`runs\runHHMMSS.png` / `runs\runHHMMSS.log.txt`。主屏约在内核启动后 20 秒出现；
 `Secs=45` 能稳定拍到主屏。
@@ -126,16 +140,22 @@ SECS=45 SHOTS=3 GAP=5 bash boot-one.sh
 | `-Serial <sn>` | `SERIAL=<sn>` | 自动 | 多设备时指定序列号 |
 | `-Payload x.bin` | `PAYLOAD=x.bin` | `boot\run-payload.bin` | 换载荷 |
 | `-Image x.img` | `IMG=x.img` | `boot\alioth-boot.img` | 换 loader 镜像 |
-| `-SkipFirmware` | `SKIP_FIRMWARE=1` | 关 | 跳过启动前的固件检查/补全 |
+| — | `FB_T=600` | 30 | 每条 fastboot 命令的超时秒数；**stage 系统卷必须 `FB_T=600`** |
+| — | `FIRMWARE=1` | 关 | 启动前下载/校验固件（仅重建系统卷需要；**默认跳过**，见 §3.1） |
+| `-SkipFirmware` | `SKIP_FIRMWARE=1` | **开** | 与上面同一开关的旧写法；固件默认就不下载 |
+
+**Git Bash 两个必踩的坑**：路径必须写 Windows 形式（`C:/...`，脚本已设 `MSYS_NO_PATHCONV=1`，
+fastboot 是 Windows 程序不认 `/c/...`）；`FB_T` 默认 30 秒，传系统卷（97 秒）必须放大。
 
 ### 3.1 固件目录与 MD5
 
 `firmware/` 放的是 **iOS 16.5 20F66（iPhone10,3 / iPhone10,6）IPSW**（6.16 GB）。
-它是一键启动**不需要**的——启动读的是 `boot/system.apfs`；它只在你想从零重建系统卷时才用到。
+它是一键启动**不需要**的——启动读的是 `boot/system.apfs`；它只在你想从零重建系统卷时才用到，
+所以**一键启动默认完全不碰固件**（`FIRMWARE=1` 才会下载/校验）。
 
-> **GitHub 仓库不包含 firmware/ 和 boot/system.apfs**（体积 + 版权限制）。克隆仓库后首次运行
-> `boot-one.bat` / `boot-one.sh` 会自动下载固件；`system.apfs` 需按 §5.4 用本机固件构建。
-> 本地交付包（U 盘/网盘版）里这两份都已经带上，可直接启动。
+> **GitHub 仓库不包含 firmware/ 和 boot/system.apfs**（体积 + 版权限制）。克隆仓库后：
+> 只启动、体验现有镜像 → 什么都不用做（`-NoSystem` 用载荷自带 root.apfs，或自备 system.apfs）；
+> 要完整桌面 → 按 §5.4 用本机固件构建 `system.apfs`（这一步才需要 IPSW）。
 
 - 文件缺失或损坏时，两个一键启动脚本会先调用 `fetch-firmware.*` 自动补全：
   `curl` 断点续传（`.part`）、最多 3 次重试，下载完按 **大小 6,165,698,198 + MD5**
@@ -184,8 +204,9 @@ REST=1 userland/build.sh
 `run-payload.bin` 当前的完整 cmdline（`inspect_payload.py` 可复核）：
 
 ```
-loader_return_after=1800 epoch=1792659000 sb_delay=8 touchscreen=1 buttons=1 touch_stat=5
-cpufreq=1 bootcpu=7 cpus=8 adreno_soc=a650 adreno=1 adreno_watch=10
+loader_return_after=240 epoch=1792659000 sb_delay=8 touchscreen=1 buttons=1 touch_stat=5
+cpufreq=1 bootcpu=7 cpus=8 adreno_soc=a650 adreno=21 adreno_skip=0 adreno_pause=0
+adreno_keep=1 adreno_watch=10
 ```
 
 | 参数 | 作用 |
@@ -197,7 +218,16 @@ cpufreq=1 bootcpu=7 cpus=8 adreno_soc=a650 adreno=1 adreno_watch=10
 | `loader_return_after=N` | N 秒后内核把控制权交回 loader（日志/截图窗口） |
 | `touch_stat=N` | 每 N 秒一行触摸统计 |
 | `sb_delay` / `epoch` | SpringBoard 启动延时 / 时间戳基准 |
-| `adreno_soc=a650 adreno=1` | Adreno 650 上电序列（GPU 画图仍卡在 step 20，见 §6） |
+| `adreno_soc=a650` | 选 K40 的 GPU 行（不能省：缺了回退 a660 去找不存在的固件） |
+| `adreno=21 adreno_skip=0 adreno_keep=1` | GPU 上电到 step 21 并**常驻**，把 Adreno 交给窗口服务器渲染（§6） |
+| `gpu_log=1` | 每帧打印 GL 统计（调 GPU 时才开） |
+
+**不要用 `gpu=1`**：它等价于 `adreno=21 adreno_skip=0x1c00 …`，会跳过 step 11（TrustZone）和
+step 12（zap 签名），导致 step 19 的 `zap_unload` SMC 挂死——这是当前内核上的已知 bug。
+排查 GPU 时可加 `gpu_log=1`；`adreno=22` 会让 GPU 画一张三色测试帧。
+
+| 其他 | 作用 |
+|---|---|
 | `touch_demo=1..6` | 注入点击/滑动/唤醒解锁（1 定点、2 竖扫、3 上滑、5 唤醒+解锁+点击、6 唤醒+解锁） |
 | `pcie=N` | QCA6390 PCIe0 分步调试（1..10），默认不带 |
 
@@ -244,7 +274,14 @@ ls "$THEOS/sdks/iPhoneOS16.5.sdk"
 ### 5.2 搭一棵构建树（两份源码合并到同一目录）
 
 上游脚本按“同一棵树”设计（`userland/build.sh` 会找 `../xnu-deps`、`../tools/apfs`、`../ios165`），
-所以先在 Linux 下把 `src/` 的两份源码叠到一起（路径不要有空格）：
+所以先在 Linux 下把 `src/` 的两份源码叠到一起（路径不要有空格）。**可以用 `ubuntu/sync.sh` 自动做**：
+
+```bash
+./ubuntu/sync.sh          # 组装到 ~/k40；也可指定目标路径
+./ubuntu/build.sh         # 检查前提后一键构建（等价于下面 5.3 + 5.4 带 GL=1）
+```
+
+或手动：
 
 ```bash
 mkdir -p ~/ios-alioth && cd ~/ios-alioth
@@ -282,7 +319,20 @@ REST=1 userland/build.sh
 
 - 没给 `LOCAL_IPSW` 时，`fetch.sh` 会从 Apple CDN 按字节区间读取两个磁盘映像（约 7.4 GB 流量，不整份下载）。
 - 没装 theos + iPhoneOS16.5.sdk 时，`build.sh` 自动 `PREBUILT=1`，用 `prebuilt/userland` 里的程序。
-- 产物：`userland/root.apfs`（4 MB）、`userland/system.apfs`（2.5 GB）。
+- 产物：`userland/root.apfs`（10.4 MB，含 GL 库与 chronod）、`userland/system.apfs`（2.5 GB）。
+- **GPU 渲染必须 `GL=1`**（完整构建命令见 `ubuntu/README.md`）：
+
+  ```bash
+  # 1) Mesa + AIR 编译器（首次约 4 分钟；会下载 46 MB 源码）
+  DRIVERS="softpipe,freedreno" AIR=1 bash tools/mk-mesa.sh
+  # 若 ninja 报 "No module named 'mesonbuild'"：Mesa 的 venv 里缺 meson，装一次即可
+  xnu-deps/build/mesa/venv/bin/pip install meson
+  # 2) 带 GL 编 userland（libredwood-gl.dylib 进 /redwood/lib，root.apfs 4 MB -> 10.4 MB）
+  SKIP="kernel loader boot" ./common/build.sh alioth GL=1
+  ```
+
+- **小组件必须 `com.apple.chronod`**：它注册 `com.apple.chronoservices`，没有它 SpringBoard 的小组件
+  只有空白容器。已加进 `userland/build.sh` 的默认 `IOS_JOBS`，无需再传 `JOBS=`。
 - GPU 固件不在源码里；要打进 `root.apfs`，先在构建树根建 `fw-gpu/`，从手机取四个文件：
 
   ```bash
@@ -314,7 +364,7 @@ python3 build_uefi.py -d alioth -r RELEASE
 ```powershell
 & python.exe src\hackios-xnu-kernel-main\xnuloader\mkpayload.py `
   -o boot\run-payload.bin kernel=boot\kernel-ios.bin ramdisk=boot\root.apfs `
-  --cmdline "loader_return_after=1800 epoch=1792659000 sb_delay=8 touchscreen=1 buttons=1 touch_stat=5 cpufreq=1 bootcpu=7 cpus=8"
+  --cmdline "loader_return_after=240 epoch=1792659000 sb_delay=8 touchscreen=1 buttons=1 touch_stat=5 cpufreq=1 bootcpu=7 cpus=8 adreno_soc=a650 adreno=21 adreno_skip=0 adreno_pause=0 adreno_keep=1 adreno_watch=10"
 & python.exe boot\inspect_payload.py boot\run-payload.bin   # 核对 cmdline 全文
 ```
 
@@ -337,8 +387,11 @@ GitHub 仓库不含 `firmware/` 与 `boot/system.apfs`（见 §3.1 / §7），�
 
 | 领域 | 状态 | 下一步 |
 |---|---|---|
-| GPU（Adreno 650） | step 1–19 真机通过（GMU 固件、HFI 队列、3D 核 525 MHz、zap 载入）；**step 20 写 `CP_SQE_CNTL=1` 触发整机复位** | 补厂商 `a6xx_start()` 其余写；或换到 UEFI 环境用同序列起 CP，判断是否 XNU 侧 SError/中断引起。详见 `docs/SESSION-HANDOFF.md` §9.5 |
-| Wi-Fi（QCA6390 PCIe0） | 上电/时钟/PHY 复位已通；PARF 寄存器访问挂死 | 实现 loader 日志缓存刷新后重跑 step 8，再 iATU / ELBI / 枚举。见 §13 |
+| GPU（Adreno 650） | **已打通**：内核 step 1–22 全过（2026-10-31 首次上机验证），CoreAnimation 经 Mesa/FD650 渲染，小组件 / Dock 材质 / 切换器全部出图。遗留：`gpu=1` 便捷开关有 bug（用显式参数绕开，见 §4） | 阴影着色器 `sb3`（函数 40）已实现但默认不注入——实测证明本无缺失；细节见 `userland/src/inject.c` |
+| 真熄屏 | **假息屏**：电源键后画黑帧，面板仍通电（AMOLED 无背光，亮度走 DCS；K40 面板 k11a 的 WLED 驱动未绑定可证）。XNU 无 DSI 驱动，面板由 UEFI DisplayDxe（闭源 .efi）初始化 | 需在 XNU 实现 MDSS DSI 命令模式 + DCS 0x28/0x10，是多会话工程 |
+| 默认壁纸 | iOS 16.5 的壁纸是 PosterBoard 程序化渲染，镜像与固件里**没有位图**；壁纸进程从未运行过，材质回落洋红 | 让 PosterBoard 跑起来并产出 wallpaper store；或注入层给 PaperBoardUI 喂真实图片（`inject_sb.c` 已有挂点说明） |
+| 存储 | About 报 "2 GB / 0 可用"：只读系统卷把可用空间报成 0。**未修复**——修复代码（按 darwin 容器 20 GiB 上报）在开发分支，且需 loader 在命令行附带 `ufs_shared_pa`（写窗口）才会在真机生效 | 数据卷本身仍是 RAM（ramfs，上限约为内存 1/4）；持久化走 `var_store`（2×2 GiB darwin 分区） |
+| Wi-Fi（QCA6390 PCIe0） | **未通**。实测（2026-11-01，pcie=7）：PHY 时钟/复位/PIPE 序列全部执行，但 step 10 首次读 DBI 即挂死（两次复现）；补 TBU/refgen 时钟票后仍挂——GCC 时钟层面已穷尽（LDO/ref_clk_src 不是 GCC 寄存器） | 对照 10-26 成品内核反汇编其 step 10 / iATU / PARF 访问序列找差异；或接 USB CDC 全量日志替代 logdump 4 KB 尾部 |
 | 音频 | `mediaserverd` 未启动，音量条电平由 userland 维持 | — |
 | CPU | 只有 4 核 online（A55 未起） | — |
 
@@ -368,15 +421,18 @@ sha256sum -c SHA256SUMS.txt        # Windows 下可用 PowerShell 的 Get-FileHa
 ```
 b7a413c2…  boot/alioth-boot.img       2,007,040 B
 bf3bcab2…  boot/uefi-alioth.fd        3,145,728 B
-d52e935c…  boot/run-payload.bin      19,323,656 B   (cmdline 见 §4)
-f64a1a77…  boot/root.apfs             4,194,304 B
+52f47426…  boot/run-payload.bin      25,600,424 B   (cmdline 见 §4)
+a8342e31…  boot/root.apfs            10,420,224 B   (含 GL 库与 chronod，见 §5.4)
 ca56e1f1…  boot/kernel-ios.bin       15,129,088 B   (与载荷内嵌的内核字节一致)
-343913d9…  boot/kernel-latest.bin    15,163,304 B
-bc15b275…  boot/system.apfs       2,492,223,488 B   （本地交付包；GitHub 仓库不含，见 §3.1）
+28aa4315…  boot/kernel-latest.bin    15,179,888 B   (2026-10-31 真机验证通过的那份)
+bc15b275…  boot/system.apfs      2,492,223,488 B   （本地交付包；GitHub 仓库不含，见 §3.1）
 ```
 
 固件不随仓库发布（6.16 GB，版权原因）：本地交付包里的 IPSW 用 `firmware/*.ipsw.md5` 校验，
-基准 MD5 为 `f87b4bd6f3c86fb174ce017b5a5ca97b`；仓库克隆后首次启动会按 §3.1 自动下载。
+基准 MD5 为 `f87b4bd6f3c86fb174ce017b5a5ca97b`；一键启动默认**不**下载它（`FIRMWARE=1` 才下载）。
+
+**Windows 检出的两个 `.dts` 校验会报 FAILED**：`core.autocrlf` 检出时把 LF 换成 CRLF 所致，
+内容未变（`git diff` 为空即一致）；在 Linux 下校验或以 `git status` 为准。
 
 **脱敏说明**：内核版本串里的构建者用户名已替换为 `buildusr`（等长替换，不影响 Mach-O 布局与运行），
 `alioth-boot.img` 内 DTB 的 `serialno` 已置零，文档中的本机路径/用户名已改为占位符。
