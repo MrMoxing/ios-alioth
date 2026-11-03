@@ -1200,6 +1200,213 @@ volume_button(bool up)
 	});
 }
 
+/*
+ * The language question, asked of CoreFoundation itself (boot-arg lang_probe=1, or the notification
+ * com.redwood.lang at any time; the lines are prefixed "ln:").
+ *
+ * The screens are in English although .GlobalPreferences holds zh-Hans-CN in all three domains, and
+ * SpringBoard formats the lock screen's date in Chinese -- so the file IS read. Two things can then
+ * still be true, and they are told apart here:
+ *   - the preference does not reach the process (cfprefsd answers for another user, or nothing),
+ *   - or it reaches it and the bundle is judged to have no Chinese: CFBundleCopyLocalizationsFor
+ *     Preferences() over the languages SpringBoard.loctable actually holds says which one it picks,
+ *     and CFBundleCopyLocalizedString() says what a key resolves to.
+ * Printed at start and again a few seconds later: if the two differ, the answer arrived late.
+ */
+static void
+say_cfstring(const char *label, CFStringRef string)
+{
+	char buffer[512];
+
+	if (string == NULL || CFGetTypeID(string) != CFStringGetTypeID()) {
+		say("redwood:   %s = (none)\n", label);
+		return;
+	}
+	if (!CFStringGetCString(string, buffer, sizeof(buffer), kCFStringEncodingUTF8)) {
+		say("redwood:   %s = (not UTF-8)\n", label);
+		return;
+	}
+	say("redwood:   %s = %s\n", label, buffer);
+}
+
+static void
+say_cfarray(const char *label, CFTypeRef value)
+{
+	char buffer[600];
+	size_t used = 0;
+	CFIndex count;
+
+	if (value == NULL) {
+		say("redwood:   %s = (none)\n", label);
+		return;
+	}
+	/* a preference can be of any type; AppleLocale is a string, and asking an array of it
+	 * (CFArrayGetCount, that is) is what killed SpringBoard the first time this ran */
+	if (CFGetTypeID(value) != CFArrayGetTypeID()) {
+		say_cfstring(label, (CFStringRef)value);
+		return;
+	}
+	count = CFArrayGetCount((CFArrayRef)value);
+	buffer[0] = '\0';
+	for (CFIndex i = 0; i < count && used < sizeof(buffer) - 1; i++) {
+		CFStringRef item = (CFStringRef)CFArrayGetValueAtIndex((CFArrayRef)value, i);
+		char one[96];
+		int wrote;
+
+		if (item == NULL || CFGetTypeID(item) != CFStringGetTypeID()) {
+			continue;
+		}
+		if (!CFStringGetCString(item, one, sizeof(one), kCFStringEncodingUTF8)) {
+			continue;
+		}
+		wrote = snprintf(buffer + used, sizeof(buffer) - used, "%s%s", used ? ", " : "", one);
+		if (wrote > 0) {
+			used += (size_t)wrote;
+		}
+	}
+	say("redwood:   %s = [%s] (%ld)\n", label, buffer, (long)count);
+}
+
+/* the languages a .loctable holds: its own top level, read as the plist it is */
+static CFArrayRef
+loctable_languages(const char *path)
+{
+	CFMutableArrayRef languages = NULL;
+	CFDataRef data;
+	CFPropertyListRef plist;
+	CFURLRef url;
+	CFIndex count;
+
+	url = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)path, (CFIndex)strlen(path), false);
+	if (url == NULL) {
+		return NULL;
+	}
+	data = CFURLCreateData(NULL, url, kCFStringEncodingUTF8, false);
+	CFRelease(url);
+	if (data == NULL) {
+		return NULL;
+	}
+	plist = CFPropertyListCreateWithData(NULL, data, kCFPropertyListImmutable, NULL, NULL);
+	CFRelease(data);
+	if (plist == NULL || CFGetTypeID(plist) != CFDictionaryGetTypeID()) {
+		if (plist != NULL) {
+			CFRelease(plist);
+		}
+		return NULL;
+	}
+	count = CFDictionaryGetCount((CFDictionaryRef)plist);
+	languages = CFArrayCreateMutable(NULL, count, &kCFTypeArrayCallBacks);
+	if (languages != NULL) {
+		const void **keys = calloc((size_t)count, sizeof(void *));
+
+		if (keys != NULL) {
+			CFDictionaryGetKeysAndValues((CFDictionaryRef)plist, keys, NULL);
+			for (CFIndex i = 0; i < count; i++) {
+				if (CFGetTypeID(keys[i]) == CFStringGetTypeID()) {
+					CFArrayAppendValue(languages, keys[i]);
+				}
+			}
+			free(keys);
+		}
+	}
+	CFRelease(plist);
+	return languages;
+}
+
+static void
+language_state(const char *when)
+{
+	static const char *table = "/System/Library/CoreServices/SpringBoard.app/SpringBoard.loctable";
+	CFBundleRef board;
+	CFURLRef url;
+	CFArrayRef value, languages;
+	CFLocaleRef locale;
+	CFStringRef string;
+
+	say("redwood: ln: %s, uid %d\n", when, (int)getuid());
+
+	value = CFPreferencesCopyAppValue(CFSTR("AppleLanguages"), kCFPreferencesAnyApplication);
+	say_cfarray("AppleLanguages (any application, this user)", value);
+	if (value != NULL) {
+		CFRelease(value);
+	}
+	value = CFPreferencesCopyValue(CFSTR("AppleLanguages"), kCFPreferencesAnyApplication,
+	    kCFPreferencesAnyUser, kCFPreferencesAnyHost);
+	say_cfarray("AppleLanguages (any user, any host)", value);
+	if (value != NULL) {
+		CFRelease(value);
+	}
+	value = CFPreferencesCopyValue(CFSTR("AppleLanguages"), kCFPreferencesAnyApplication,
+	    kCFPreferencesAnyUser, kCFPreferencesCurrentHost);
+	say_cfarray("AppleLanguages (any user, this host)", value);
+	if (value != NULL) {
+		CFRelease(value);
+	}
+	value = CFPreferencesCopyAppValue(CFSTR("AppleLocale"), kCFPreferencesAnyApplication);
+	say_cfarray("AppleLocale (any application, this user)", value);
+	if (value != NULL) {
+		CFRelease(value);
+	}
+	value = CFLocaleCopyPreferredLanguages();
+	say_cfarray("CFLocaleCopyPreferredLanguages", value);
+	if (value != NULL) {
+		CFRelease(value);
+	}
+	locale = CFLocaleCopyCurrent();
+	if (locale != NULL) {
+		say_cfstring("CFLocaleCopyCurrent", CFLocaleGetIdentifier(locale));
+		CFRelease(locale);
+	}
+	/* the system's own answer, without a bundle in the way: is the preference understood at all */
+	{
+		CFStringRef wanted = CFLocaleCreateCanonicalLanguageIdentifierFromString(NULL, CFSTR("zh-Hans-CN"));
+
+		say_cfstring("zh-Hans-CN canonicalised", wanted);
+		if (wanted != NULL) {
+			CFRelease(wanted);
+		}
+	}
+	languages = loctable_languages(table);
+	say_cfarray("languages in SpringBoard.loctable", languages);
+	if (languages != NULL) {
+		value = CFBundleCopyLocalizationsForPreferences(languages, NULL);
+		say_cfarray("bundle localizations, by this process's preferences", value);
+		if (value != NULL) {
+			CFRelease(value);
+		}
+		value = CFBundleCopyPreferredLocalizationsFromArray(languages);
+		say_cfarray("bundle localizations, best first", value);
+		if (value != NULL) {
+			CFRelease(value);
+		}
+	}
+	url = CFURLCreateWithFileSystemPath(NULL, CFSTR("/System/Library/CoreServices/SpringBoard.app"),
+	    kCFURLPOSIXPathStyle, true);
+	board = url != NULL ? CFBundleCreate(NULL, url) : NULL;
+	if (url != NULL) {
+		CFRelease(url);
+	}
+	if (board == NULL) {
+		say("redwood:   the SpringBoard bundle could not be opened\n");
+	} else {
+		string = CFBundleCopyLocalizedString(board, CFSTR("LOW_BATT_TITLE"), CFSTR("<no such key>"), NULL);
+		say_cfstring("LOW_BATT_TITLE, default table", string);
+		if (string != NULL) {
+			CFRelease(string);
+		}
+		string = CFBundleCopyLocalizedString(board, CFSTR("LOW_BATT_TITLE"), CFSTR("<no such key>"),
+		    CFSTR("SpringBoard"));
+		say_cfstring("LOW_BATT_TITLE, table SpringBoard", string);
+		if (string != NULL) {
+			CFRelease(string);
+		}
+		CFRelease(board);
+	}
+	if (languages != NULL) {
+		CFRelease(languages);
+	}
+}
+
 __attribute__((constructor))
 static void
 redwood_springboard_init(void)
@@ -1253,6 +1460,26 @@ redwood_springboard_init(void)
 	 * would go with it, holding exactly the sentence we wanted.
 	 */
 	setvbuf(stdout, NULL, _IONBF, 0);
+	/*
+	 * The language, asked early and again once the system has settled (boot-arg lang_probe=1), and
+	 * at any time on com.redwood.lang: see language_state().
+	 */
+	{
+		char arguments[1024] = "";
+		size_t size = sizeof(arguments) - 1;
+
+		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 &&
+		    strstr(arguments, "lang_probe=1") != NULL) {
+			language_state("at start");
+			dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 25 * NSEC_PER_SEC),
+			    dispatch_get_main_queue(), ^{
+				language_state("25 s in");
+			});
+		}
+	}
+	notify_register_dispatch("com.redwood.lang", &token, dispatch_get_main_queue(), ^(__unused int t) {
+		language_state("asked");
+	});
 	slide = (uintptr_t)_dyld_get_shared_cache_range(&length) - CACHE_BASE;
 	activation = replace_method("SBLockdownManager", "_setupActivationState", 0x1c4bc8dfcUL, (IMP)setup_activation_state);
 	_dyld_register_func_for_add_image(image_added);         /* Siri's orb, whose framework comes late */
