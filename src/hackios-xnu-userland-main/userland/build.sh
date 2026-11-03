@@ -522,6 +522,11 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	# the prefix with the root on the flash, downloads every package and index there, and without it each
 	# download ended in "No such file or directory"
 	printf 'd\t700\t501\t501\t/private/var/mobile/tmp\n' >> root/etc/var.skel
+	# the system-wide preference domain: iOS has /private/var/preferences, where a daemon that runs as
+	# root reads the any-user values (the language among them) before any user is logged in. The
+	# template of this image has no such directory and nothing created it, so the system domain of
+	# .GlobalPreferences was missing entirely -- see docs/SESSION-HANDOFF.md, the language entry
+	printf 'd\t755\t0\t0\t/private/var/preferences\n' >> root/etc/var.skel
 	# A key of ours for root, when there is one: ssh/authorized_keys, never in the repository (like
 	# fw-*). dropbear from the package manager's prefix reads it and lets us in over the phone's
 	# Wi-Fi, which saves rebuilding an image for every question one wants to ask a running iOS. It
