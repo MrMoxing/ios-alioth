@@ -194,6 +194,9 @@ for ($i = 0; $i -lt 30; $i++) {
 }
 if (-not $fbDev) { throw "$Serial 没有进入 bootloader（还停在 Android）；不继续等待。" }
 
+Say "erase the logdump partition (one clean log per run)"
+try { $null = Invoke-Tool -Exe $Fastboot -Arguments @("erase", "logdump") -TimeoutSec 60 } catch { Write-Host "logdump erase failed: $_" }
+
 Say "boot the loader (fastboot boot: RAM only)"
 $null = Invoke-Tool -Exe $Fastboot -Arguments @("boot", $ImagePath) -TimeoutSec 60
 $loaderUp = $false

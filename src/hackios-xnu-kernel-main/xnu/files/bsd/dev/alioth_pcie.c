@@ -5,7 +5,8 @@
  * qcom,pcie@1c00000 -- not the AHB radio (WCN6750) the rest of this tree's Wi-Fi driver was
  * written for (redwood_wifi.c). Everything below is this phone's: the device tree's node
  * qcom,pcie@1c00000 (reg-names parf, phy, dm_core, elbi, iatu, conf), the clock controller's
- * PCIe0 entries (gcc-sm8250.c) and the PCIe block's offsets (pcie-qcom.c).
+ * PCIe0 entries (gcc-sm8250.c) and the PCIe block's offsets (the vendor 4.19 tree's pci-msm.c,
+ * the driver this phone actually runs: msm_pcie_enable, msm_pcie_link_train).
  *
  * Addresses, from the phone's own device tree (read from it with `dtc -I dtb -O dts`):
  *   parf   0x01c00000 + 0x3000       phy   0x01c06000 + 0x1000
@@ -20,20 +21,27 @@
  *   slv_q2a_axi), the phy's own two clocks at 0x6f004 and 0x6f02c, the bus clock at 0x9000c,
  *   and the two block resets 0x6b000 (core) and 0x6c01c (phy).
  *
- * The steps are how this is to be found out, in the order the vendor driver takes them, and one that
- * fails says so and stops the sequence (the table of them is at the bottom of this file):
+ * The steps are how this is to be found out, in the order the vendor driver takes them (pci-msm.c's
+ * msm_pcie_enable then msm_pcie_link_train), and one that fails says so and stops the sequence (the
+ * table of them is at the bottom of this file):
  *   1  reads   what the boot loader and Android left: the power switch, the clock votes and their halt
  *              state, the resets, the PHY's status word, and the endpoint's reset line (PERST)
- *   2-3  assert PERST (the endpoint held in reset), switch the controller's own power on and vote for
- *              its six clocks
- *   4  switches the aux clock's source generator on (the wrapper's own register access depends on it)
- *   5  the vendor's register writes: the core reset, root-complex mode, the reference generator, the DBI
+ *   2  votes   for the PHY's power: the three rails the device tree gives the controller's node
+ *              (pm8150_l9 at 1.2 V, pm8150_l5 at 0.88 V, cx at nominal), through RPMh
+ *   3-4  raise WLAN_EN (gpio 20, the radio's own enable line), assert PERST, switch the controller's own
+ *              power on, vote for its six clocks and for the endpoint's clock reference (0x8c004)
+ *   5  switches the aux clock's source generator on (the wrapper's own register access depends on it)
+ *   6  the vendor's register writes: the core reset, root-complex mode, the reference generator, the DBI
  *              base (0x350: this IP revision's offset), the system and power-management words, the NoC
  *              clocks, the MHI clock reset
- *   6-7  the PHY: its auxiliary clock, its power-down word, its 99 pairs, its ready bit
- *   8-9  read the whole clock corner, then the wrapper's registers
- *   10 reads   the core's own windows: configuration space, address translator, DBI, ELBI
- *   11 release PERST, turn the link training state machine on and see whether the core moves its state
+ *   7-8  the PHY: its auxiliary clock, its 99 pairs, its reset pulse, its ready bit
+ *   9-10  read the whole clock corner, then the wrapper's registers
+ *   11 brings  the link up in the vendor's order: PERST out, the training registers in, the state machine
+ *              on, and the vendor's three checks polled together
+ *
+ * Nothing touches the core's own windows (0x60000000) before step 11 has the endpoint out of reset: a
+ * DBI access with PERST held took the machine down twice -- 2026-11-03 here, 2026-10-30 in the UniXNU
+ * record of the same phone.
  *
  * Boot-arg pcie=N performs steps 1 to N and stops (pcie_skip=MASK leaves out steps by 1<<N);
  * pcie_pause=MS is how long a step waits after announcing a group of accesses (default 2200).
@@ -48,6 +56,7 @@
 #include <vm/vm_kern.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
 extern void thread_terminate(thread_t thread);
 extern void loader_log_line(const char *line);
 extern void loader_log_flush(void);
@@ -77,7 +86,14 @@ announce(const char *what);
 static void
 pause_group(void)
 {
-	if (pcie_step == pcie_last_step && pcie_pause_ms) {
+	/*
+	 * A pause after EVERY step, not only the last one: the loader writes the log out every
+	 * two seconds, so a machine that dies inside a step takes its own announcements with it.
+	 * With the pause, the lines of each step reach the logdump before the next step runs,
+	 * and the last flushed line names the access that killed the machine (2026-11-03, the
+	 * deaths at four and a half seconds left no pcie line at all).
+	 */
+	if (pcie_pause_ms) {
 		sleep_ms(pcie_pause_ms);
 	}
 }
@@ -96,7 +112,15 @@ static struct {
 	{ "iatu", 0x60001000, 0x1000 },
 	{ "conf", 0x60100000, 0x100000 },
 	{ "dbi", 0x60000000, 0x1000 },   /* the core's own 4 KB: DBI at its start, ELBI at 0xf20 */
-	{ "tlmm-north", 0x0f900000, 0x90000 },  /* gpio79 (PERST) is in the north tile: 0x1000 * 79 */
+	/*
+	 * The TLMM: the device tree gives it 0x0f000000 + 16 MB, and the vendor's pinctrl-kona.c puts a
+	 * pin's registers at a tile base (north 0x900000, south 0x500000, west 0x100000) plus 0x1000 * pin.
+	 * The tiles interleave -- gpio 0-3 and 24-27 south, 4-23 and 77-96 north -- so a pin that is not of
+	 * a tile is a hole in it, and the first read of a hole took the machine down twice (2026-11-03: the
+	 * south read of gpio 20 at 0x0f514000, then the flat 0x0f114000). Both of our pins are north:
+	 * WLAN_EN gpio 20 at 0x0f914000 and PERST gpio 79 at 0x0f94f000.
+	 */
+	{ "tlmm-north", 0x0f900000, 0x90000 },
 };
 
 static uint64_t
@@ -160,11 +184,218 @@ perst_release(void)
 	line("PERST released (high): io %#x", rd(PERST_IO));
 }
 
+/*
+ * WLAN_EN: the radio's own enable line, TLMM gpio 20 -- which pinctrl-kona.c puts in the NORTH tile
+ * (PINGROUP(20, NORTH, qup7, ...); the tiles interleave, 4-23 north), so its registers are at
+ * 0x0f900000 + 0x1000 * 20 = 0x0f914000. The first version had it in the south tile (the SDM845-style
+ * "gpio 0-76 south" reading), and the first read of that address took the machine down (p20, p21,
+ * 2026-11-03). The cnss driver's cnss_wlan_en_active asks for gpio mode, 16 mA drive, pull-up and
+ * output high, and raises the line before anything on the PCIe side happens: the QCA6390 does not
+ * come out of its own reset until it. The UniXNU record of this phone measured the pair
+ * PERST#/WLAN_EN never written by the ten steps it inherited, and no link ever trained.
+ */
+#define WLANEN_GPIO             20
+#define WLANEN_CFG              (reg(7, 0x1000UL * WLANEN_GPIO))
+#define WLANEN_IO               (reg(7, 0x1000UL * WLANEN_GPIO + 4))
+
+static void
+wlanen_raise(void)
+{
+	uint32_t cfg = rd(WLANEN_CFG), io = rd(WLANEN_IO);
+
+	line("WLAN_EN (gpio20, north) before: cfg %#x, io %#x", cfg, io);
+	wr(WLANEN_IO, 0);       /* the level first, as with PERST */
+	wr(WLANEN_CFG, (cfg & ~PERST_CTL_MASK) | (7u << 6) | 3u | (1u << 9));   /* gpio mode, 16 mA, pull-up, out */
+	wr(WLANEN_IO, 2);
+	line("WLAN_EN raised (high): cfg %#x, io %#x", rd(WLANEN_CFG), rd(WLANEN_IO));
+}
+
+/*
+ * The PHY's own power: it has no GDSC of its own, but three rails the device tree gives the controller's
+ * node (vreg-1p8-supply, vreg-0p9-supply, vreg-cx-supply) and nobody has voted for: pm8150_l9 at 1.2 V,
+ * pm8150_l5 at 0.88 V, both in the high-power mode the tree's init-mode 4 names, and the cx rail at level
+ * 256, nominal. The votes go the way redwood_cpufreq.c's memory bandwidth vote goes: through the
+ * application processor's RPMh sequencer (dt: rsc@18200000, the operating system's DRV 2), the resources
+ * found by name in the command database the boot loader left at 0x80860000. A VRM resource is four words
+ * at its address -- the voltage in millivolts, the enable, the mode, the headroom (the vendor's
+ * rpmh-regulator.c) -- and a level resource is one: the level asked for.
+ */
+#define CMD_DB_PHYS             0x80860000UL
+#define CMD_DB_SIZE             0x20000UL
+
+struct cmd_db_slave {
+	uint16_t id, header_offset, data_offset, count, version, reserved[3];
+};
+struct cmd_db_header {
+	uint32_t version;
+	uint8_t magic[4];
+	struct cmd_db_slave slave[8];
+	uint32_t checksum, reserved;
+	uint8_t data[];
+};
+struct cmd_db_entry {
+	char id[8];
+	uint32_t priority[2];
+	uint32_t address;
+	uint16_t length, offset;
+};
+
+static const struct cmd_db_header *pcie_cmd_db;
+
+static uint32_t
+cmd_db_address(const char *name)
+{
+	char id[8] = { 0 };
+
+	if (pcie_cmd_db == NULL) {
+		pcie_cmd_db = (const struct cmd_db_header *)ml_io_map_wcomb(CMD_DB_PHYS, CMD_DB_SIZE);
+	}
+	if (pcie_cmd_db == NULL ||
+	    pcie_cmd_db->magic[0] != 0xdb || pcie_cmd_db->magic[1] != 0x30 ||
+	    pcie_cmd_db->magic[2] != 0x03 || pcie_cmd_db->magic[3] != 0x0c) {
+		return 0;
+	}
+	strlcpy(id, name, sizeof(id));
+	for (unsigned s = 0; s < 8; s++) {
+		const struct cmd_db_slave *slave = &pcie_cmd_db->slave[s];
+		unsigned long long base, room, entries;
+
+		/* every read here stays inside the 128 KiB the mapping gives: a read past it takes the machine */
+		if (slave->id == 0 || slave->count == 0 || slave->count > 512) {
+			continue;
+		}
+		base = (unsigned long long)(uintptr_t)pcie_cmd_db->data + slave->header_offset;
+		if (base < (unsigned long long)(uintptr_t)pcie_cmd_db->data ||
+		    base >= (unsigned long long)(uintptr_t)pcie_cmd_db->data + CMD_DB_SIZE) {
+			continue;
+		}
+		room = (unsigned long long)(uintptr_t)pcie_cmd_db->data + CMD_DB_SIZE - base;
+		entries = room / sizeof(struct cmd_db_entry);
+		if (entries > slave->count) {
+			entries = slave->count;
+		}
+		{
+			const struct cmd_db_entry *entry = (const struct cmd_db_entry *)(uintptr_t)base;
+
+			for (unsigned i = 0; i < entries; i++) {
+				if (memcmp(entry[i].id, id, sizeof(id)) == 0) {
+					return entry[i].address;
+				}
+			}
+		}
+	}
+	return 0;
+}
+
+#define RSC_PHYS                0x18220000UL    /* the application processor's RPMh sequencer, DRV 2 */
+#define RSC_SIZE                0x10000UL
+#define RSC_TCS(reg)            (0xd00 + (reg)) /* command slot set 0, an "active" one, as redwood_cpufreq.c */
+#define TCS_IRQ_ENABLE          0x00
+#define TCS_IRQ_STATUS          0x04
+#define TCS_CONTROL             0x14
+#define TCS_STATUS              0x18
+#define TCS_ENABLED             0x1c
+#define TCS_COMMAND(c)          (0x30 + 20 * (c))       /* its flags; then its address, its value, its status */
+#define RPMH_WRITE_WAITED       (0x10008u | 0x100)      /* a 4-byte write, with a response */
+
+/* Up to `count` writes through command slot set 0, and the wait until RPMh has done them. */
+static bool
+rpmh_write(vm_offset_t rsc, const uint32_t *address, const uint32_t *data, unsigned count)
+{
+	uint32_t irq_enable = rd(rsc + RSC_TCS(TCS_IRQ_ENABLE));
+	bool done = false;
+
+	for (int i = 0; rd(rsc + RSC_TCS(TCS_STATUS)) == 0; i++) {
+		if (i > 2000) {
+			line("the RPMh command slots stay busy");
+			return false;
+		}
+		sleep_us(100);
+	}
+	wr(rsc + RSC_TCS(TCS_CONTROL), rd(rsc + RSC_TCS(TCS_CONTROL)) & ~((1u << 24) | (1u << 16)));
+	wr(rsc + RSC_TCS(0x08), 1);
+	for (unsigned i = 0; i < count; i++) {
+		wr(rsc + RSC_TCS(TCS_COMMAND(i)), RPMH_WRITE_WAITED);
+		wr(rsc + RSC_TCS(TCS_COMMAND(i) + 4), address[i]);
+		wr(rsc + RSC_TCS(TCS_COMMAND(i) + 8), data[i]);
+	}
+	wr(rsc + RSC_TCS(0x10), (1u << count) - 1);
+	wr(rsc + RSC_TCS(TCS_ENABLED), (1u << count) - 1);
+	wr(rsc + RSC_TCS(TCS_IRQ_ENABLE), irq_enable | 1);
+	wr(rsc + RSC_TCS(TCS_CONTROL), 1u << 16);
+	wr(rsc + RSC_TCS(TCS_CONTROL), (1u << 16) | (1u << 24));
+	for (int i = 0; i < 2000 && !done; i++) {
+		done = (rd(rsc + RSC_TCS(TCS_IRQ_STATUS)) & 1) != 0;
+		if (!done) {
+			sleep_us(100);
+		}
+	}
+	wr(rsc + RSC_TCS(TCS_CONTROL), rd(rsc + RSC_TCS(TCS_CONTROL)) & ~((1u << 24) | (1u << 16)));
+	wr(rsc + RSC_TCS(TCS_ENABLED), 0);
+	wr(rsc + RSC_TCS(0x10), 0);
+	wr(rsc + RSC_TCS(0x08), 1);
+	wr(rsc + RSC_TCS(TCS_IRQ_ENABLE), irq_enable);
+	return done;
+}
+
+static bool
+step_power(void)
+{
+	static const struct {
+		const char *name, *what;
+		bool vrm;               /* a VRM resource takes the voltage, the enable and the mode; a level one the level */
+		uint32_t voltage_mv, level;
+	} rails[] = {
+		{ "ldoa9", "pm8150_l9, the PHY's 1.2 V (dt: vreg-1p8)", true, 1200, 0 },
+		{ "ldoa5", "pm8150_l5, the PHY's 0.88 V (dt: vreg-0p9)", true, 880, 0 },
+		{ "cx.lvl", "the cx rail, the PHY's logic (dt: vreg-cx)", false, 0, 256 },
+	};
+	uint32_t address[3 * 3], data[3 * 3], count = 0;
+	vm_offset_t rsc;
+
+	announce("vote for the PHY's power: the three rails the device tree gives the controller's node, through the RPMh "
+	    "command database (0x80860000) and its sequencer (0x18220000)");
+	for (unsigned r = 0; r < sizeof(rails) / sizeof(rails[0]); r++) {
+		uint32_t base = cmd_db_address(rails[r].name);
+
+		line("%s (%s) at %#x", rails[r].name, rails[r].what, base);
+		if (base == 0) {
+			printf("pcie: %u: THE COMMAND DATABASE HAS NO %s\n", pcie_step, rails[r].name);
+			return false;
+		}
+		if (rails[r].vrm) {
+			address[count] = base + 0;      /* the voltage, in millivolts (the vendor's rpmh-regulator.c) */
+			data[count++] = rails[r].voltage_mv;
+			address[count] = base + 4;      /* the enable */
+			data[count++] = 1;
+			address[count] = base + 8;      /* the mode: 7 is pmic5-ldo high power (the tree's init-mode 4) */
+			data[count++] = 7;
+		} else {
+			address[count] = base;          /* the level: 256 is nominal (the tree's vreg-cx-voltage-level) */
+			data[count++] = rails[r].level;
+		}
+	}
+	rsc = ml_io_map(RSC_PHYS, RSC_SIZE);
+	if (rsc == 0) {
+		printf("pcie: %u: NO MEMORY FOR THE RPMh SEQUENCER\n", pcie_step);
+		return false;
+	}
+	line("the sequencer: control %#x, status %#x, enabled %#x", rd(rsc + RSC_TCS(TCS_CONTROL)),
+	    rd(rsc + RSC_TCS(TCS_STATUS)), rd(rsc + RSC_TCS(TCS_ENABLED)));
+	if (!rpmh_write(rsc, address, data, count)) {
+		printf("pcie: %u: THE POWER VOTE GOT NO ANSWER FROM RPMh\n", pcie_step);
+		return false;
+	}
+	line("the power vote is in (%u commands: ldoa9 %u mV, ldoa5 %u mV, both mode 7, cx level 256)", count,
+	    rails[0].voltage_mv, rails[1].voltage_mv);
+	sleep_ms(10);           /* a moment for the regulators to settle */
+	return true;
+}
+
 static void
 say(const char *fmt, ...)
 {
 	__builtin_va_list ap;
-
 	printf("pcie: %u: ", pcie_step);
 	__builtin_va_start(ap, fmt);
 	vprintf(fmt, ap);
@@ -341,12 +572,13 @@ map_all(void)
 #define GCC_PCIE_0_PHY_BCR      0x6c01c
 #define GCC_PCIE_PHY_BCR        0x6f000
 #define GCC_PCIE_PHY_COM_BCR    0x6f010
+#define GCC_PCIE_WIFI_CLKREF    0x8c004         /* GCC_PCIE_WIFI_CLKREF_EN: the endpoint's clock reference (the tree's pcie_0_ldo) */
 
 #define GDSC_POWER_ON           (1u << 31)
 #define GDSC_SW_COLLAPSE        (1u << 0)
 #define GDSC_RETAIN_FF_ENABLE   (1u << 11)
 
-#define PHY_STATUS              0x814           /* dt: qcom,phy-status-offset; bit 6: ready */
+#define PHY_STATUS              0x814           /* dt: qcom,phy-status-offset; ready is bit 6 at 0 (the vendor's pcie_phy_is_ready) */
 #define PHY_POWER_DOWN          0x840           /* dt: qcom,phy-power-down-offset */
 
 #define GDSC_PWR_ON             (1u << 31)      /* gdsc.c: PWR_ON_MASK */
@@ -386,17 +618,17 @@ step_look(void)
 		return true;
 	}
 	pause_group();
-	get(1, "phy_status", PHY_STATUS);
-	get(1, "phy_power_down", PHY_POWER_DOWN);
-	get(2, "parf_sys_ctrl", 0x00);
-	get(2, "parf_phy_ctrl", 0x40);
-	get(2, "parf_phy_refclk", 0x4c);
-	get(2, "parf_dbi_base_v2 (0x350: this IP revision)", 0x350);
-	get(2, "parf_dbi_base_v1 (0x168: what the driver used before)", 0x168);
-	get(2, "parf_slv_addr_space_size_v2", 0x358);
-	get(2, "parf_ltssm", 0x1b0);
-	get(2, "parf_q2a_flush", 0x1ac);
-	get(2, "parf_bdf_translate", 0x24c);
+	get(2, "phy_status", PHY_STATUS);
+	get(2, "phy_power_down", PHY_POWER_DOWN);
+	get(1, "parf_sys_ctrl", 0x00);
+	get(1, "parf_phy_ctrl", 0x40);
+	get(1, "parf_phy_refclk", 0x4c);
+	get(1, "parf_dbi_base_v2 (0x350: this IP revision)", 0x350);
+	get(1, "parf_dbi_base_v1 (0x168: what the driver used before)", 0x168);
+	get(1, "parf_slv_addr_space_size_v2", 0x358);
+	get(1, "parf_ltssm", 0x1b0);
+	get(1, "parf_q2a_flush", 0x1ac);
+	get(1, "parf_bdf_translate", 0x24c);
 	get(3, "elbi_sys_ctrl", 0x04);
 	get(7, "perst_gpio79 cfg", 0x1000 * PERST_GPIO);
 	get(7, "perst_gpio79 io", 0x1000 * PERST_GPIO + 4);
@@ -408,11 +640,23 @@ step_gdsc(void)
 {
 	uint32_t gdscr, waited;
 
-	announce("hold the endpoint in reset (PERST low), switch the controller's own power on: the software collapse bit "
-	    "out of its power switch, then wait for its power-on bit");
+	announce("raise the radio's own enable line, hold the endpoint in reset (PERST low), switch the controller's own "
+	    "power on: the software collapse bit out of its power switch, then wait for its power-on bit");
+	pause_group();          /* the announce goes out before anything of the step is touched */
+	wlanen_raise();         /* the cnss driver raises wlan-en before anything on the PCIe side */
+	sleep_ms(1);            /* a moment for the radio's own reset to come out */
+	/*
+	 * A pause after each of the step's three groups: the run of 2026-11-03 (p19) died in this step
+	 * without a single one of its lines in the log -- the loader only writes the log out every quarter
+	 * of a second, and the first access took the machine before any of them was written down. With the
+	 * pauses, the last written line names the access that kills (p20).
+	 */
+	pause_group();
 	perst_assert();
+	pause_group();
 	gdscr = get(0, "pcie_0_gdscr", GCC_PCIE_0_GDSCR);
 	put(0, "pcie_0_gdscr", GCC_PCIE_0_GDSCR, gdscr & ~GDSC_SW_COLLAPSE);
+	pause_group();
 	for (waited = 0; waited < 100; waited++) {
 		if (rd(GCC(GCC_PCIE_0_GDSCR)) & GDSC_PWR_ON) {
 			break;
@@ -431,10 +675,15 @@ step_gdsc(void)
 static bool
 step_clocks(void)
 {
-	announce("vote for its clocks (slv_axi, mstr_axi, cfg_ahb, aux, pipe, slv_q2a) and read the halt state of each");
+	announce("vote for its clocks (slv_axi, mstr_axi, cfg_ahb, aux, pipe, slv_q2a), the endpoint's own clock "
+	    "reference, and read the halt state of each");
 	put(0, "pcie_0_axi_misc (vote for its clocks)", GCC_PCIE_0_AXI_MISC, rd(GCC(GCC_PCIE_0_AXI_MISC)) | CLOCK_VOTES);
+	/* the reference the radio's side is clocked with: the UniXNU record of this phone measured it
+	 * off (0x80000000) until its bit was voted, and it is what the vendor's pcie_0_ldo asks for */
+	put(0, "pcie_wifi_clkref (the endpoint's reference)", GCC_PCIE_WIFI_CLKREF, rd(GCC(GCC_PCIE_WIFI_CLKREF)) | 1u);
 	sleep_ms(1);
 	get(0, "pcie_0_axi_misc after", GCC_PCIE_0_AXI_MISC);
+	get(0, "pcie_wifi_clkref after", GCC_PCIE_WIFI_CLKREF);
 	get(0, "pcie_0_slv_axi_halt", GCC_PCIE_0_SLV_AXI_HALT);
 	get(0, "pcie_0_mstr_axi_halt", GCC_PCIE_0_MSTR_HALT);
 	get(0, "pcie_0_cfg_ahb_halt", GCC_PCIE_0_CFG_AHB_HALT);
@@ -459,23 +708,19 @@ step_phy(void)
 {
 	uint32_t status;
 
-	announce("wake the PHY: its own auxiliary clock on, its power-down word cleared, and its status bit that says it is "
-	    "ready");
+	announce("wake the PHY: its own auxiliary clock on, and a look at its power-down word and status");
 	put(0, "pcie_phy_aux (the PHY's clock)", GCC_PCIE_PHY_AUX, rd(GCC(GCC_PCIE_PHY_AUX)) | 1u);
 	sleep_ms(1);
 	get(0, "pcie_phy_aux after", GCC_PCIE_PHY_AUX);
 	pause_group();
-	get(2, "phy_power_down", PHY_POWER_DOWN);
-	get(2, "phy_status", PHY_STATUS);
-	put(2, "phy_power_down (clear)", PHY_POWER_DOWN, rd(reg(2, PHY_POWER_DOWN)) & ~1u);
-	for (uint32_t waited = 0; waited < 100; waited++) {
-		status = rd(reg(2, PHY_STATUS));
-		if (status & (1u << 6)) {
-			break;
-		}
-		sleep_ms(1);
-	}
-	line("the PHY %s (status %#x, bit 6 is its ready)", (status & (1u << 6)) ? "IS READY" : "IS NOT READY", status);
+	/*
+	 * Only reads here: the vendor never writes the power-down word outside the dt's own sequence
+	 * (whose first pair, 0x840 = 3, is what switches the PHY on) and outside its teardown path
+	 * (pci-msm.c writes 0 there). The first version cleared bit 0 by hand -- a step the vendor
+	 * does not take.
+	 */
+	status = get(2, "phy_status (before the sequence)", PHY_STATUS);
+	line("the PHY reads %#x (its ready is bit 6 at 0)", status);
 	return true;
 }
 
@@ -514,48 +759,28 @@ step_phy_seq(void)
 	};
 
 	announce("write the PHY's own sequence, the pairs the device tree keeps (qcom,phy-sequence: register and value, all of "
-	    "them in the PHY's own 4 KB), then wait for its ready bit");
+	    "them in the PHY's own 4 KB), its reset pulsed before them the way the vendor does, and its ready bit waited for");
 	/*
-	 * A reset pulse of the PHY's own two blocks first (not the common one: releasing that one after the PHY's
-	 * own stopped the machine), and its auxiliary clock voted again once they are out -- a block reset takes
-	 * the clock branch with it.
+	 * The vendor's order (pci-msm.c: msm_pcie_clk_init, then pcie_phy_init): the PHY's reset -- 0x6c01c,
+	 * the device tree's "pcie_0_phy_reset" -- is pulsed with the clocks on and BEFORE the sequence is
+	 * written, and nothing resets anything after it. (The vendor's post-sequence pulse wants
+	 * "pcie_0_phy_pipe_reset", which this phone's tree does not have -- and the run of 2026-11-03 that
+	 * pulsed 0x6c01c after the sequence wiped the PHY's registers: start control read 0, the software
+	 * reset bit back at 1, the status stuck at 0x68. The core's own reset belongs before the PARF writes
+	 * and step 6 already pulses it there: pulsing it here would wipe those writes with it.)
 	 */
 	put(0, "pcie_0_phy_bcr (assert)", GCC_PCIE_0_PHY_BCR, 1);
-	put(0, "pcie_phy_bcr (assert)", GCC_PCIE_PHY_BCR, 1);
-	sleep_ms(2);
+	sleep_ms(1);
 	put(0, "pcie_0_phy_bcr (release)", GCC_PCIE_0_PHY_BCR, 0);
-	put(0, "pcie_phy_bcr (release)", GCC_PCIE_PHY_BCR, 0);
-	sleep_ms(20);
-	put(0, "pcie_phy_aux again", GCC_PCIE_PHY_AUX, rd(GCC(GCC_PCIE_PHY_AUX)) | 1u);
-	/* its reference generator at the rate the device tree gives it, before its own sequence is written */
-	put(0, "phy_refgen_src cfg (100 MHz)", 0x6f018, 0x501);
-	put(0, "phy_refgen_src root enable", 0x6f014, 0x2);
-	put(0, "pcie0_phy_refgen again", GCC_PCIE_0_PHY_REFGEN, rd(GCC(GCC_PCIE_0_PHY_REFGEN)) | 1u);
-	/*
-	 * And which reference the PHY takes: PARF_PHY_REFCLK's bit 12 is USE_PAD in mainline's header -- the PHY
-	 * looking for its reference on a pad. This board clocks the PHY from its own reference generator, so the
-	 * bit is cleared before the sequence is written.
-	 */
-	{
-		uint32_t value = get(1, "parf_phy_refclk", 0x4c);
-
-		put(1, "parf_phy_refclk (pad reference off)", 0x4c, value & ~(1u << 12));
-		get(1, "parf_phy_refclk after", 0x4c);
-	}
-	sleep_ms(100);          /* qcom_pcie_phy_power_on() waits before it touches the PHY again */
-	get(0, "pcie_phy_aux after the reset", GCC_PCIE_PHY_AUX);
-	get(0, "pcie_0_phy_bcr after", GCC_PCIE_0_PHY_BCR);
-	/*
-	 * The common PHY block's own reset, released only now: it was released before the PHY's own in the run
-	 * that ended the machine, so the order here is the other one -- the PHY's own out first, a wait, then this.
-	 */
-	put(0, "pcie_phy_com_bcr (release)", GCC_PCIE_PHY_COM_BCR, 0);
 	sleep_ms(10);
+	/* a block reset takes the clock branch with it: vote the PHY's own clocks again */
+	put(0, "pcie_phy_aux again", GCC_PCIE_PHY_AUX, rd(GCC(GCC_PCIE_PHY_AUX)) | 1u);
+	put(0, "pcie0_phy_refgen again", GCC_PCIE_0_PHY_REFGEN, rd(GCC(GCC_PCIE_0_PHY_REFGEN)) | 1u);
 	for (unsigned i = 0; i < sizeof(phy_sequence) / sizeof(phy_sequence[0]); i++) {
 		wr(reg(2, phy_sequence[i].reg), phy_sequence[i].value);
 	}
-	sleep_ms(10);
-	/* the last two pairs are the start control (0x844) and the word before it: what the PLL was told to do */
+	sleep_ms(1);            /* the vendor's PHY_STABILIZATION_DELAY, then the ready poll */
+	/* the last pairs are the start control (0x844) and the word before it: what the PLL was told to do */
 	get(2, "phy_start_control", 0x844);
 	get(2, "phy_800", 0x800);
 	get(2, "phy_9a4", 0x9a4);
@@ -565,13 +790,14 @@ step_phy_seq(void)
 
 		for (uint32_t waited = 0; waited < 20; waited++) {
 			status = rd(reg(2, PHY_STATUS));
-			if (status & (1u << 6)) {
+			if ((status & (1u << 6)) == 0) {
 				break;
 			}
 			sleep_ms(10);
 		}
-		line("the PHY %s (status %#x, bit 6 is its ready)", (status & (1u << 6)) ? "IS READY" : "DID NOT BECOME READY",
-		    status);
+		/* the vendor's pcie_phy_is_ready wants bit 6 at 0: set, the PHY is still coming up */
+		line("the PHY %s (status %#x, the vendor's ready is bit 6 at 0)",
+		    (status & (1u << 6)) ? "DID NOT BECOME READY" : "IS READY", status);
 	}
 	return true;
 }
@@ -696,10 +922,12 @@ step_parf_init(void)
 
 	/*
 	 * The PHY node in the device tree asks for this clock at 100 MHz (assigned-clock-rates with
-	 * GCC_PCIE0_PHY_REFGEN_CLK): source 1 is GPLL0's main output at 600 MHz through a divider of six,
-	 * the divider field holding the divider minus one (gcc-sm8250.c's ftbl_gcc_pcie_phy_refgen_clk_src).
+	 * GCC_PCIE0_PHY_REFGEN_CLK): the vendor's table (gcc-kona.c's ftbl_gcc_pcie_phy_refgen_clk_src) asks
+	 * for GPLL0's main output at 600 MHz through a divider of six, so source 1 and the divider field
+	 * holding the divider minus one -- 0x105, and not 0x501, which the first version wrote (a source the
+	 * parent map does not even have; found against the vendor clock table, 2026-11-03).
 	 */
-	put(0, "phy_refgen_src cfg (source 1, divide by 6: 100 MHz)", 0x6f018, 0x501);
+	put(0, "phy_refgen_src cfg (source 1, divide by 6: 100 MHz)", 0x6f018, 0x105);
 	put(0, "phy_refgen_src root enable", 0x6f014, 0x2);
 	sleep_ms(2);
 	get(0, "phy_refgen_src rcgr after", 0x6f014);
@@ -749,72 +977,84 @@ step_parf_init(void)
 }
 
 /*
- * The controller's own configuration space (the DBI window at 0x60000000) and the link control block at 0x60000f20.
- * The ELBI read is last: in the run before this one the log ended on exactly that access, so whatever comes before
- * it is what this step is for.
+ * The DBI registers msm_pcie_link_train touches before it turns the state machine on (pci-msm.c offsets).
  */
-static bool
-step_dbi(void)
-{
-	/*
-	 * The configuration space first: it is the one the system would enumerate through, and it is a window of
-	 * its own (0x60100000) rather than part of the core's 4 KB. The address translator and the core's own 4 KB
-	 * follow; the link control block is last, since that is the access the run before this one ended on.
-	 */
-	announce("ask the controller's windows in the order that tells them apart: the configuration space the buses are "
-	    "seen through, the address translator, the core's own 4 KB, and the link control block");
-	get(5, "conf_vendor_device (bus 0, device 0, function 0)", 0x00);
-	get(5, "conf_header_type", 0x0c);
-	get(5, "conf_capability", 0x34);
-	get(4, "iatu_viewport", 0x00);
-	get(6, "dbi_vendor_device", 0x00);
-	get(6, "dbi_capability", 0x70);
-	get(3, "elbi_sys_ctrl", 0x04);
-	return true;
-}
+#define DBI_GEN2_CTRL           0x80c   /* [12:8] the fast training sequences: the vendor asks for one */
+#define DBI_GEN3_RELATED        0x890   /* bit 0 clear: the Gen3 equalization is not skipped */
+#define DBI_GEN3_MISC_CONTROL   0x8bc   /* bit 0: the preset's gate */
+#define DBI_SPCIE_CAP           0x154   /* the Gen3 preset the vendor equalizes with */
+#define DBI_DEVICE_CONTROL      0x78    /* [14:12] the largest read request: the vendor asks for 5 */
 
 /*
- * Turn the link training state machine on and look at what the core writes back into the wrapper's own copy
- * of its state (PARF_LTSSM): if the low bits move, the core is running even though the window it serves never
- * answered; if they stay where they were, the core itself has no clock or no power.
+ * The link, in the vendor's order (msm_pcie_enable then msm_pcie_link_train): the device tree's ep-latency
+ * wait, the reset line out, the training registers, the state machine on, and the vendor's three checks
+ * polled together. Nothing may touch the core's own windows before the endpoint is out of reset: a DBI
+ * access with PERST held took the machine down twice -- 2026-11-03 here, 2026-10-30 in the UniXNU record.
  */
 static bool
 step_ltssm(void)
 {
-	uint32_t before, after;
+	uint32_t value;
 
-	announce("bring the endpoint out of reset (PERST high), then turn the link training state machine on and see "
-	    "whether the core moves its state");
+	announce("the vendor's order: the endpoint out of reset, its training words in, the state machine on, and "
+	    "its three checks for the link");
+	sleep_ms(10);           /* the vendor's ep-latency, before the reset line goes up */
 	perst_release();
 	sleep_us(1000);         /* the vendor waits a millisecond after the reset line goes up */
-	before = get(1, "parf_ltssm", 0x1b0);
-	put(1, "parf_ltssm (training on)", 0x1b0, before | (1u << 8));
-	sleep_ms(50);
-	after = get(1, "parf_ltssm after", 0x1b0);
-	line("the core's link state %s (before %#x, after %#x)",
-	    ((after ^ before) & 0x1fu) ? "MOVED" : "DID NOT MOVE", before, after);
-	return true;
+
+	value = get(6, "dbi gen2_ctrl", DBI_GEN2_CTRL);
+	put(6, "dbi gen2_ctrl (one fast training sequence)", DBI_GEN2_CTRL, (value & ~0x1f00u) | (1u << 8));
+	value = get(6, "dbi gen3_related", DBI_GEN3_RELATED);
+	put(6, "dbi gen3_related (equalization not skipped)", DBI_GEN3_RELATED, value & ~1u);
+	value = get(6, "dbi gen3_misc_control", DBI_GEN3_MISC_CONTROL) | 1u;
+	put(6, "dbi gen3_misc_control (the preset's gate open)", DBI_GEN3_MISC_CONTROL, value);
+	put(6, "dbi spcie_cap (the Gen3 preset)", DBI_SPCIE_CAP, 0x55555555u);
+	put(6, "dbi gen3_misc_control (the preset's gate shut)", DBI_GEN3_MISC_CONTROL, value & ~1u);
+	value = get(6, "dbi device_control", DBI_DEVICE_CONTROL);
+	put(6, "dbi device_control (the largest read, 5)", DBI_DEVICE_CONTROL, (value & ~0x7000u) | (5u << 12));
+
+	put(1, "parf_ltssm (training on)", 0x1b0, get(1, "parf_ltssm", 0x1b0) | (1u << 8));
+
+	/* the vendor's three checks together: the wrapper's link-state word (XMLH_LINK_UP, bit 10 of
+	 * ELBI_SYS_STTS), the data-link layer's active bit (DLLLA, bit 29 of DBI 0x80), and the core's
+	 * own vendor and device answering in DBI 0x00 -- 20 rounds, 5 ms apart, as the vendor polls */
+	for (uint32_t waited = 0; waited < 20; waited++) {
+		uint32_t stts = rd(reg(3, 0x08));
+		uint32_t dll = rd(reg(6, 0x80));
+		uint32_t id = rd(reg(6, 0x00));
+
+		line("the link after %u ms: elbi %#x, dll %#x, id %#x", waited * 5, stts, dll, id);
+		if ((stts & 0x400u) && (dll & (1u << 29)) && id != 0xffffffffu) {
+			line("THE LINK IS UP after %u ms (endpoint %#04x:%#04x)", waited * 5, id & 0xffff, id >> 16);
+			get(1, "parf_ltssm after", 0x1b0);
+			return true;
+		}
+		sleep_ms(5);
+	}
+
+	printf("pcie: %u: THE LINK DID NOT COME UP in 100 ms\n", pcie_step);
+	return false;
 }
 
 /* ---- what runs ------------------------------------------------------------------------------ */
 
 /*
- * In the order the vendor driver's host init takes them: the controller's clocks and its own registers first
- * (qcom_pcie_init_2_7_0), then the PHY's power-on and its sequence (phy_power_on), then the pipe clock and the
- * rest -- which is why the PHY steps come after the registers now.
+ * In the order the vendor driver takes them (pci-msm.c's msm_pcie_enable and msm_pcie_link_train): the
+ * controller's clocks and its own registers first, then the PHY's power-on and its sequence, then the
+ * endpoint out of reset and its training registers before the state machine goes on.
  */
 static bool (*const steps[])(void) = {
 	step_look,              /* 1  read what the boot loader and Android left */
-	step_gdsc,              /* 2  the controller's own power switch */
-	step_clocks,            /* 3  the six clock branches in 0x52008 */
-	step_aux_src,           /* 4  the aux clock's source generator (the wrapper's APB clock) */
-	step_parf_init,         /* 5  the vendor's register writes, the core reset, the reference generator */
-	step_phy,               /* 6  the PHY's auxiliary clock and its power-down word */
-	step_phy_seq,           /* 7  the PHY's own 99 pairs and its ready bit */
-	step_clocks_dump,       /* 8  the whole PCIe0 corner of the clock controller */
-	step_parf,              /* 9  the wrapper's registers, once everything above is on */
-	step_dbi,               /* 10 the core's own windows: conf, iATU, DBI, ELBI */
-	step_ltssm,             /* 11 turn the link training state machine on and see if the core moves */
+	step_power,             /* 2  the PHY's three rails (1.2 V, 0.88 V, cx nominal), voted through RPMh */
+	step_gdsc,              /* 3  the radio's own enable line, PERST low, the controller's own power switch */
+	step_clocks,            /* 4  the six clock branches in 0x52008 and the endpoint's reference in 0x8c004 */
+	step_aux_src,           /* 5  the aux clock's source generator (the wrapper's APB clock) */
+	step_parf_init,         /* 6  the vendor's register writes, the core reset, the reference generator */
+	step_phy,               /* 7  the PHY's auxiliary clock and a look at its status */
+	step_phy_seq,           /* 8  the PHY's own 99 pairs and its ready bit */
+	step_clocks_dump,       /* 9  the whole PCIe0 corner of the clock controller */
+	step_parf,              /* 10 the wrapper's registers, once everything above is on */
+	step_ltssm,             /* 11 PERST out, the vendor's training words, the state machine on, the vendor's checks */
 };
 
 void
@@ -843,7 +1083,7 @@ alioth_pcie_init(void)
 	if (!map_all()) {
 		return;
 	}
-	line("the six blocks are mapped");
+	line("the %u blocks are mapped", BLOCK_NAMES);
 	pcie_last_step = steps_wanted;
 	{
 		uint32_t delay_ms = 0;
@@ -855,8 +1095,14 @@ alioth_pcie_init(void)
 		 */
 		PE_parse_boot_argn("pcie_delay", &delay_ms, sizeof(delay_ms));
 		if (delay_ms) {
-			printf("pcie: waiting %u ms before the steps\n", delay_ms);
 			sleep_ms(delay_ms);
+			/*
+			 * Announced through line() and not printf: the loader only writes what went through
+			 * loader_log_line into its log, and the run of 2026-11-03 died in the (18 s, 20 s)
+			 * window with the thread not due until 20.5 s -- this line is what tells whether the
+			 * sleep even ended (p16).
+			 */
+			line("the %u ms delay is over; the thread comes next", delay_ms);
 		}
 	}
 	{
@@ -899,7 +1145,8 @@ pcie_steps_thread(void *argument, wait_result_t wait_result)
 {
 	(void)argument;
 	(void)wait_result;
-	map_all();
+	line("the steps thread is on the processor");
+	/* the blocks were mapped before this thread was started: alioth_pcie_init() ran map_all() first */
 	run_steps();
 	printf("pcie: the thread that ran the steps is done\n");
 	thread_terminate(current_thread());
