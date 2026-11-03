@@ -1173,3 +1173,47 @@ RPMh regulator 或常开），其余"时钟"多半也非 GCC branch。
   `backup-full-78685cf` 保险分支与 `public` 分支（= 远程内容）。
 - **约定**：某个功能真机验证通过前，其提交不上 `public`/远程；推远程一律从 `public` 线
   cherry-pick 或 rebase，`main` 保持本地开发史。
+
+### 13.13 存储打通：loader 块服务上线，根卷报 20 GiB / 12.2 GiB 可用（11-03 13:2x，真机验证）
+
+**一句话**：`ufs=2` 让 loader 把共享页交给内核，119 个 `/dev/rufs_*` 设备上线；根卷的 statfs 现在
+报 **20,971,500 KB 总量 / 12,803,988 KB 可用**（`runs/df10.log.txt`，df 实测），不再是「2 GB / 0」。
+
+**怎么用**：payload 的 cmdline 加 `ufs=2`（只读；写入还要 `ufs_write=1` 且手机上有 darwin 分区）。
+loader 自己会往内核命令行追加 `ufs_shared_pa=0x…`（`loader.c:3008`，`block_enabled` 由 `ufs=2` 置位）。
+
+**四个真机事实**（都是本轮实测，别再猜）：
+1. **loader 有块服务**。`ufs=1` 只读勘察打印 `ufs: 6 raw units, 119 partitions`；`ufs=2` 打印
+   `ufs: block service: 119 partitions and 6 units, page a1650000, buffer a121e000 of 4096 KB`，
+   并把 `ufs_shared_pa=0x00000000a1650000` 写进内核命令行。
+2. **这台手机没有 darwin 分区**。119 个分区里没有 `darwin`；移植里说的 darwin
+   （LBA 25374720..30617594，20 GiB）是 **userdata 尾部的一段**，作者机上切过、这台没切。
+   后果：读可用，**写不可用**（`block_is_darwin()` 找不到它就一个字节都不写）。要持久化必须先
+   解决分区（见下）。
+3. **statfs 的出口是 `vfs_getattr`，不是挂载时那份缓存**。XNU 8796 每次 `statfs(2)` 都会
+   `vfs_update_vfsstat()` → `vfs_getattr` 重新取 `f_blocks/f_bfree`，所以往 `mnt_vfsstatfs`
+   里写的值会被覆盖（这就是 13.8-13.11 那几次「改了没效果」的真正原因）。修复点：
+   `apfs_vfsops.c:apfs_vfs_getattr()` —— 有 darwin 就报 darwin 的块数与剩余。
+4. **内核 `printf` 的早期输出进不了日志**（控制台起来之前的都丢）。要看到内核自己的数，用
+   `loader_log_line()`（本轮的 `apfs: statfs: darwin 5242875 blocks, 3200507 free` 就是这么出来的）。
+
+**代码改动**（三处，都在 wip 分支）：
+- `bsd/dev/redwood_ufs.c`：`redwood_ufs_darwin_blocks()/free_bytes()` 已存在；init 入口加了
+  `loader_log_line` 诊断（`ufs: init: ufs_shared_pa parsed 1, pa 0xa1650000`）。
+- `bsd/miscfs/apfs/apfs_vfsops.c`：`apfs_vfs_getattr()` 增加 darwin 分支；`apfs_statfs_refresh()`
+  保留（挂载末尾 + ufs 就绪各调一次），但真正生效的是 getattr。
+- `boot-one.sh`：从 fastboot 状态起步时 `$ADB` 未定义的回归已修（`ADB=${ADB:-adb}`）。
+
+**构建坑（本轮踩了 4 次，务必记住）**：
+- `xnu-build.sh` **不会**跑 `apply.sh`；overlay（`~/k40/xnu/files`）改了不会自动进 `xnu-src`。
+- `apply.sh` 对已补丁的树返回 2，别指望它同步。
+- 改完源码要 `rm -f BUILD/obj/.../bsd/DEVELOPMENT/{apfs_vfsops,redwood_ufs}.o` 再编，否则 make
+  认为最新（同一秒时间戳）。
+- 跨 shell 的 `$VAR` 会被吞，WSL 操作一律用脚本文件 + 绝对路径。
+
+**下一步（持久化）**：手机上没有 darwin。三条路，按风险从低到高：
+1. **借 `logdump` 尾部**（64 MB，日志只占前 2 MB）：把 loader 的写窗口从「darwin」改成
+   「logdump 的 8192..16383 块」，内核 `ufs_write=1` 写 prefs 就够用，且完全不碰 Android 的
+   userdata。需要重编 loader（UEFI）+ 改内核的边界检查。
+2. **借 `oops`（16 MB，Qualcomm 崩溃转储区）**：同上，但空间更小。
+3. **真切 darwin**：从 userdata 尾部离线重分区（要缩 f2fs），风险最高，不建议现在做。

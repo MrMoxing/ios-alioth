@@ -229,6 +229,10 @@ if [ -s "$LOG" ]; then
 	echo "log: $LOG.txt ($(wc -c < "$LOG.txt") bytes)"
 fi
 
+# a run that started at the bootloader never chose a device over adb; the count above is what
+# the phone is, and "adb" alone finds it (the serial is only needed when several are attached)
+ADB=${ADB:-adb}
+
 if [ "${REBOOT:-0}" = 1 ]; then
 	say "back to Android (REBOOT=1)"
 	fb reboot >/dev/null 2>&1

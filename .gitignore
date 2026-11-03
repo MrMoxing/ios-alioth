@@ -15,3 +15,7 @@ Thumbs.db
 
 # 本地镜像备份
 *.bak*
+
+# 启动脚本的临时输出（每次运行覆盖）
+boot-*.out
+reference/

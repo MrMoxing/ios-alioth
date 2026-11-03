@@ -140,6 +140,9 @@ apfs_dev_read_data(void *ctx, uint64_t off, void *buf, size_t len)
  * volume is mounted and cleared when it goes away.
  */
 static struct apfs_mount *apfs_the_mount;
+
+/* fills the mount's statfs from darwin once the phone's storage is up (below) */
+void apfs_statfs_refresh(void);
 static LCK_MTX_DECLARE(apfs_pool_lock, &apfs_lck_grp);   /* the pool's threads, and apfs_mounts */
 
 /*
@@ -460,6 +463,11 @@ apfs_stats_print(void)
 
 /* kern.redwood_memory: the kernel's line about memory (osfmk/arm64/loader_return.c), for a job list to keep */
 extern void redwood_memory_line(char *buf, size_t len);
+
+/* The capacity answers of the phone's own storage (bsd/dev/redwood_ufs.c): darwin whole, and what
+ * is free past what the build wrote. Without the loader's page both answer nothing. */
+extern uint64_t redwood_ufs_darwin_blocks(void);
+extern uint64_t redwood_ufs_darwin_free_bytes(void);
 
 static int
 sysctl_redwood_memory SYSCTL_HANDLER_ARGS
@@ -1171,6 +1179,12 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint32_t contain
 	sp = vfs_statfs(mp);
 	sp->f_bsize = am->am_nx.block_size;
 	sp->f_iosize = am->am_nx.block_size;
+	/*
+	 * The image's numbers for now: at mount time the phone's storage is not this kernel's to ask
+	 * yet (redwood_ufs's page comes up later), and the displays read these. apfs_statfs_refresh()
+	 * below replaces them once the storage is ready -- the container of this port is darwin, and
+	 * answering the image alone said "2 GB, 0 available", which read as a full telephone.
+	 */
 	sp->f_blocks = am->am_nx.block_count;
 	sp->f_bfree = 0;
 	sp->f_bavail = 0;
@@ -1183,6 +1197,9 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint32_t contain
 	strlcpy(sp->f_fstypename, "apfs", sizeof(sp->f_fstypename));
 
 	apfs_the_mount = am;
+	/* the storage may already be up (redwood_ufs comes up before this mount): in that order
+	   its own refresh found no mount to write to, and the numbers would stay the image's */
+	apfs_statfs_refresh();
 	am->am_rdev = vnode_specrdev(devvp);
 	lck_mtx_lock(&apfs_pool_lock);
 	am->am_next = apfs_mounts;
@@ -1209,6 +1226,43 @@ apfs_mountroot(mount_t mp, vnode_t devvp, vfs_context_t ctx)
 	(void)PE_parse_boot_argn("apfs_root_c", &c, sizeof(c));
 	(void)PE_parse_boot_argn("apfs_root_v", &v, sizeof(v));
 	return apfs_mount_common(mp, devvp, ctx, c, v);
+}
+
+/*
+ * The numbers of the root volume, again. The mount filled them before the phone's storage was this
+ * kernel's to ask (redwood_ufs's page comes up later than the root volume does), and they said
+ * "2 GB, 0 available" -- the image's size and nothing free, which every application that looks
+ * before it writes reads as a full telephone. The container of this port is darwin: the system
+ * volume and the cryptexes of the build sit in its first blocks, and past them everything that
+ * comes back between boots goes (bsd/dev/redwood_ufs.c, var_store). So what a volume here answers
+ * is darwin whole, and what is free in it is what is left past the build-written part less what
+ * this run has written. Called by redwood_ufs once its page is up; without it (QEMU, no storage)
+ * it does nothing, and the numbers of the mount stay.
+ */
+void
+apfs_statfs_refresh(void)
+{
+	struct apfs_mount *am = apfs_the_mount;
+	struct vfsstatfs *sp;
+	uint64_t free_bytes;
+
+	if (am == NULL || am->am_mp == NULL || redwood_ufs_darwin_blocks() == 0) {
+		return;
+	}
+	sp = vfs_statfs(am->am_mp);
+	free_bytes = redwood_ufs_darwin_free_bytes();
+	sp->f_blocks = redwood_ufs_darwin_blocks();
+	sp->f_bfree = free_bytes / sp->f_bsize;
+	sp->f_bavail = sp->f_bfree;
+	sp->f_bused = sp->f_blocks > sp->f_bfree ? sp->f_blocks - sp->f_bfree : 0;
+	{
+		char line[128];
+		extern void loader_log_line(const char *line);
+
+		snprintf(line, sizeof(line), "apfs: statfs: darwin %llu blocks, %llu free",
+		    (uint64_t)sp->f_blocks, (uint64_t)sp->f_bfree);
+		loader_log_line(line);
+	}
 }
 
 /*
@@ -1371,14 +1425,24 @@ apfs_vfs_getattr(mount_t mp, struct vfs_attr *fsap, __unused vfs_context_t ctx)
 {
 	struct apfs_mount *am = APFS_MP(mp);
 	uint64_t files = am->am_vol.num_files + am->am_vol.num_dirs;
+	/*
+	 * The space a volume here reports is darwin's, once the phone's storage is up: the image is
+	 * one part of it, and past the image is where everything that comes back between boots goes
+	 * (bsd/dev/redwood_ufs.c). statfs(2) refills the per-mount numbers from this call, so this is
+	 * where the answer has to come from -- a value written into the mount earlier is replaced by
+	 * what is returned here. Without the storage (QEMU, no ufs_shared_pa) both answer 0 and the
+	 * volume keeps the image's numbers.
+	 */
+	uint64_t darwin_blocks = redwood_ufs_darwin_blocks();
+	uint64_t darwin_free = darwin_blocks != 0 ? redwood_ufs_darwin_free_bytes() / (am->am_nx.block_size ? am->am_nx.block_size : 4096) : 0;
 
 	VFSATTR_RETURN(fsap, f_objcount, files);
 	VFSATTR_RETURN(fsap, f_bsize, am->am_nx.block_size);
 	VFSATTR_RETURN(fsap, f_iosize, am->am_nx.block_size);
-	VFSATTR_RETURN(fsap, f_blocks, am->am_nx.block_count);
-	VFSATTR_RETURN(fsap, f_bfree, 0);
-	VFSATTR_RETURN(fsap, f_bavail, 0);
-	VFSATTR_RETURN(fsap, f_bused, am->am_vol.alloc_count);
+	VFSATTR_RETURN(fsap, f_blocks, darwin_blocks != 0 ? darwin_blocks : am->am_nx.block_count);
+	VFSATTR_RETURN(fsap, f_bfree, darwin_blocks != 0 ? darwin_free : 0);
+	VFSATTR_RETURN(fsap, f_bavail, darwin_blocks != 0 ? darwin_free : 0);
+	VFSATTR_RETURN(fsap, f_bused, darwin_blocks != 0 ? (darwin_blocks > darwin_free ? darwin_blocks - darwin_free : 0) : am->am_vol.alloc_count);
 	VFSATTR_RETURN(fsap, f_files, files);
 	VFSATTR_RETURN(fsap, f_ffree, 0);
 

@@ -410,6 +410,33 @@ redwood_ufs_dev(dev_t dev)
 }
 
 /*
+ * What the storage has, for the displays that ask (Settings's storage page, About's capacity,
+ * every application that looks before writing). The container of this port is darwin: the system
+ * volume and the cryptexes of the build sit in its first blocks, and past them everything that
+ * comes back between boots (var_store) is written. So the capacity a volume reports is darwin
+ * whole, and what is free in it is what is left past the build-written part less what this run
+ * has already written. Without the loader's page (early in the start, or on a machine without
+ * the phone's storage) both answer nothing, and the volumes keep what they said before.
+ */
+uint64_t
+redwood_ufs_darwin_blocks(void)
+{
+	return ufs_ready ? UFS_DARWIN_BLOCKS : 0;
+}
+
+uint64_t
+redwood_ufs_darwin_free_bytes(void)
+{
+	uint64_t used_blocks;
+
+	if (!ufs_ready) {
+		return 0;
+	}
+	used_blocks = UFS_WRITE_FIRST + ufs_write_bytes / 4096;
+	return used_blocks >= UFS_DARWIN_BLOCKS ? 0 : (UFS_DARWIN_BLOCKS - used_blocks) * 4096;
+}
+
+/*
  * Where the time of reading the storage went, so far: waiting for core 0's answer (of which
  * the loader's own clock says how long ReadBlocks itself took) and copying out of its buffer.
  */
@@ -1445,8 +1472,17 @@ redwood_ufs_init(void)
 	uint32_t check = 0, made = 0;
 	vm_offset_t base;
 
-	if (!PE_parse_boot_argn("ufs_shared_pa", &pa, sizeof(pa)) || pa == 0) {
-		return;                 /* the loader was not asked for ufs=2: there is nothing to read through */
+	{
+		bool got = PE_parse_boot_argn("ufs_shared_pa", &pa, sizeof(pa));
+		char line[96];
+		extern void loader_log_line(const char *line);
+
+		snprintf(line, sizeof(line), "ufs: init: ufs_shared_pa parsed %d, pa 0x%llx", got, (unsigned long long)pa);
+		loader_log_line(line);
+
+		if (!got || pa == 0) {
+			return;                 /* the loader was not asked for ufs=2: there is nothing to read through */
+		}
 	}
 	base = ml_io_map_unmappable((vm_offset_t)(pa & ~(UFS_PAGE - 1)),
 	    ((pa & (UFS_PAGE - 1)) + sizeof(struct loader_block) + UFS_PAGE - 1) & ~(UFS_PAGE - 1), VM_WIMG_WCOMB);
@@ -1488,6 +1524,13 @@ redwood_ufs_init(void)
 		made++;
 	}
 	ufs_ready = true;
+	/* the root volume's statfs said "the image's size, 0 free" at mount time (this page was not
+	   up yet); with the storage here, it answers darwin's capacity and what is left of it */
+	{
+		extern void apfs_statfs_refresh(void);
+
+		apfs_statfs_refresh();
+	}
 	printf("ufs: %u partitions of the phone's storage as /dev/ufs_NAME and /dev/rufs_NAME, read only, "
 	    "through the loader's page at %llx and its %u KB buffer\n", made, pa, ufs_buffer_size >> 10);
 

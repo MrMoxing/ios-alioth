@@ -1,0 +1,6 @@
+# Storage probe, late enough that redwood_ufs has come up: the numbers statfs answers,
+# and whether the device nodes exist by then.
+/bin/sleep 45
+/bin/df -k /
+/bin/df -k /private/var
+/bin/df -k
