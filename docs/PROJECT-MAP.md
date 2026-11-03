@@ -22,10 +22,10 @@
 
 | 文件 | 用途 | 关键参数 |
 |---|---|---|
-| `boot-one.ps1` | **Windows 一键上机**（PowerShell，13 KB） | `-Secs 45` `-Shots 3` `-Gap 5` `-Image` `-Payload` `-SystemImage` `-OutDir` `-NoSystem` `-SkipFirmware` `-Reboot` |
+| `boot-one.ps1` | **Windows 一键上机**（PowerShell，13 KB） | `-Secs 45` `-Shots 3` `-Gap 5` `-Image` `-Payload` `-SystemImage` `-OutDir` `-NoSystem` `-Reboot` |
 | `boot-one.sh` | Linux/WSL 同上（7.4 KB） | 环境变量 `SECS=45 SHOTS=3 GAP=5` |
 | `boot-one.bat` | 双击入口，转调 ps1 | — |
-| `fetch-firmware.ps1/.sh/.bat` | 从 `root.apfs` 补全固件到工作区（重建 system.apfs 时才需要） | — |
+| `fetch-firmware.ps1/.sh/.bat` | 独立的固件获取工具（重建 system.apfs 时才用；**boot-one 不调用**） | — |
 | `SHA256SUMS.txt` | `boot/` 内镜像的校验和 | — |
 | `README.md` | 20 KB 总说明（含"从零重建"的 §5.4） | — |
 
@@ -179,11 +179,11 @@
 
 | 我想…… | 用这个，别自己写 |
 |---|---|
-| **在真机上跑一轮（推荐）** | `FB_T=600 SKIP_FIRMWARE=1 REBOOT=1 bash boot-one.sh`（**Git Bash**） |
+| **在真机上跑一轮（推荐）** | `FB_T=600 REBOOT=1 bash boot-one.sh`（**Git Bash**） |
 | 只调内核、不要完整系统 | `SYS= bash boot-one.sh`（根 = 载荷自带 `root.apfs`，省 98 秒） |
 | 换内核 | `PAYLOAD="C:/path/payload.bin" bash boot-one.sh` |
 | 换系统卷 | `SYS="C:/path/system.apfs" bash boot-one.sh` |
-| **不想等 5.74 GB 固件下载** | **一定加 `SKIP_FIRMWARE=1`**（临时启动根本不需要） |
+| 要 IPSW（只在重建系统卷时） | 手动跑 `fetch-firmware.bat` / `bash fetch-firmware.sh`；启动流程不下载固件 |
 
 ### ⚠️ 上机三个必踩的坑（2026-10-31 实测）
 

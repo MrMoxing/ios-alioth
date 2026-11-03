@@ -6,8 +6,8 @@
 #
 # This package already contains everything the boot needs (see boot/): the UEFI, the loader, the
 # kernel payload, the iOS system image and the GPU firmware (inside root.apfs). firmware/ holds the
-# Apple IPSW, which is only the input for rebuilding system.apfs; if it is missing or corrupt,
-# fetch-firmware.sh downloads it and checks size + MD5 (SKIP_FIRMWARE=1 skips that check).
+# Apple IPSW, which is only the input for rebuilding system.apfs; this script never downloads it --
+# run fetch-firmware.sh yourself when you rebuild.
 #
 # usage (Git Bash):  bash boot-one.sh
 #   SECS=60 bash boot-one.sh        # let the kernel run longer before the screenshot
@@ -67,24 +67,9 @@ if [ -n "$SYS" ] && [ ! -f "$SYS" ]; then
 	SYS=
 fi
 if [ -n "$SYS" ]; then
-	echo "images: $(basename "$IMG"), $(basename "$PAYLOAD"), $(basename "$SYS") -- no firmware download needed"
+	echo "images: $(basename "$IMG"), $(basename "$PAYLOAD"), $(basename "$SYS")"
 else
 	echo "images: $(basename "$IMG"), $(basename "$PAYLOAD") -- kernel-only (no system image)"
-fi
-
-say "firmware (rebuild input; not needed for this boot)"
-# Firmware is the input of rebuilding system.apfs, never of booting: a run boots the loader, the
-# payload and (for the full desktop) the system image that ships with the package. Downloading
-# 5.74 GB of it at every run costs minutes and reads the network for nothing, so it is off unless
-# asked for (FIRMWARE=1) or the images are missing and a rebuild is the only way.
-if [ "${SKIP_FIRMWARE:-1}" = 1 ]; then
-	echo "skipped (default; FIRMWARE=1 to fetch the 5.74 GB rebuild input)"
-elif [ -f "$ROOT/fetch-firmware.sh" ]; then
-	if ! bash "$ROOT/fetch-firmware.sh"; then
-		echo "boot-one: 固件缺失/校验失败，不影响本次启动，继续。" >&2
-	fi
-else
-	echo "no fetch-firmware.sh; skipping firmware check"
 fi
 
 say "phone state"

@@ -6,7 +6,8 @@
 .DESCRIPTION
   和同目录的 boot-one.sh 等价，纯 Windows PowerShell 实现（截图用 .NET 转 PNG，不需要 Python）。
   本包 boot/ 里已含 UEFI、loader、内核载荷、iOS 系统卷和 GPU 固件（在 root.apfs 内），
-  因此启动不需要下载任何固件；只有从零重建 system.apfs 时才需要 Apple IPSW，见 README §5.4。
+  启动不下载任何固件；只有从零重建 system.apfs 时才需要 Apple IPSW（那时自己运行
+  fetch-firmware.ps1），见 README §5.4。
   若 boot/system.apfs 缺失，脚本会自动降级为“只启动内核”，并提示重建方法。
 
 .PARAMETER Secs
@@ -23,9 +24,6 @@
 
 .PARAMETER NoSystem
   不 stage 2.5 GB 的 system.apfs，只用载荷自带的 root.apfs 当根（内核/驱动调试用）。
-
-.PARAMETER SkipFirmware
-  跳过启动前的固件检查/补全。固件只在重建 system.apfs 时才需要，临时启动不用它。
 
 .PARAMETER Reboot
   跑完回到 Android。默认不回安卓：脚本拷完日志/截图后，手机继续留在 iOS 里运行。
@@ -51,7 +49,6 @@ param(
     [string]$SystemImage = "system.apfs",
     [string]$OutDir = "",
     [switch]$NoSystem,
-    [switch]$SkipFirmware,
     [switch]$Reboot
 )
 
@@ -168,26 +165,9 @@ if ($UseSystem -and -not (Test-Path -LiteralPath $SystemPath)) {
     $UseSystem = $false
 }
 if ($UseSystem) {
-    Write-Host "镜像：$([IO.Path]::GetFileName($ImagePath)), $([IO.Path]::GetFileName($PayloadPath)), $([IO.Path]::GetFileName($SystemPath)) —— 无需下载任何固件"
+    Write-Host "镜像：$([IO.Path]::GetFileName($ImagePath)), $([IO.Path]::GetFileName($PayloadPath)), $([IO.Path]::GetFileName($SystemPath))"
 } else {
     Write-Host "镜像：$([IO.Path]::GetFileName($ImagePath)), $([IO.Path]::GetFileName($PayloadPath)) —— 仅内核（不 stage 系统卷）"
-}
-
-Say "firmware（重建系统卷的原料，临时启动不需要）"
-if ($SkipFirmware) {
-    Write-Host "skipped (-SkipFirmware)"
-} else {
-    $fwScript = Join-Path $Root "fetch-firmware.ps1"
-    if (Test-Path -LiteralPath $fwScript) {
-        try {
-            & $fwScript
-        } catch {
-            Write-Host "firmware: $($_.Exception.Message)" -ForegroundColor Yellow
-            Write-Host "firmware: 缺失/校验失败不影响本次启动，继续。" -ForegroundColor Yellow
-        }
-    } else {
-        Write-Host "no fetch-firmware.ps1; skipping firmware check" -ForegroundColor Yellow
-    }
 }
 
 Say "phone state"

@@ -6,7 +6,6 @@ rem
 rem   boot-one.bat
 rem   boot-one.bat -Secs 60 -Shots 3 -Gap 5
 rem   boot-one.bat -NoSystem
-rem   boot-one.bat -SkipFirmware
 setlocal
 set "HERE=%~dp0"
 if not exist "%HERE%boot-one.ps1" (

@@ -51,12 +51,12 @@ ios-alioth/
 ├── boot-one.bat                一键启动（Windows 入口，双击或命令行；不需要 Git Bash/Python）
 ├── boot-one.ps1                boot-one.bat 的实现（.NET 截图转换、超时控制）
 ├── boot-one.sh                 一键启动（Git Bash；按设备状态续跑：Android / bootloader / xnuloader）
-├── fetch-firmware.bat          固件获取（Windows 入口）
+├── fetch-firmware.bat          固件获取（Windows 入口；独立工具，boot-one 不调用）
 ├── fetch-firmware.ps1          fetch-firmware.bat 的实现（断点续传 + 大小/MD5）
 ├── fetch-firmware.sh           固件获取（Git Bash；断点续传 + 大小/MD5）
 ├── ubuntu/                     Linux 构建入口：sync.sh 组装工作树、build.sh 一键构建、README
 ├── runs/                       运行产物（首次运行自动创建）：runHHMMSS.png / .log.txt
-├── firmware/                   本地固件目录（**不入库**）：iOS 16.5 IPSW，仅重建系统卷时需要（默认不下载）
+├── firmware/                   本地固件目录（**不入库**）：iOS 16.5 IPSW，仅重建系统卷时需要（启动流程不下载）
 │   ├── iPhone10,3,iPhone10,6_16.5_20F66_Restore.ipsw
 │   ├── iPhone10,3,iPhone10,6_16.5_20F66_Restore.ipsw.md5   基准 MD5
 │   └── .verified               校验通过标记（脚本快速路径）
@@ -141,8 +141,6 @@ loader 已在跑（`product: xnuloader`）→ 跳过 boot 直接续跑后续步�
 | `-Payload x.bin` | `PAYLOAD=x.bin` | `boot\run-payload.bin` | 换载荷 |
 | `-Image x.img` | `IMG=x.img` | `boot\alioth-boot.img` | 换 loader 镜像 |
 | — | `FB_T=600` | 30 | 每条 fastboot 命令的超时秒数；**stage 系统卷必须 `FB_T=600`** |
-| — | `FIRMWARE=1` | 关 | 启动前下载/校验固件（仅重建系统卷需要；**默认跳过**，见 §3.1） |
-| `-SkipFirmware` | `SKIP_FIRMWARE=1` | **开** | 与上面同一开关的旧写法；固件默认就不下载 |
 
 **Git Bash 两个必踩的坑**：路径必须写 Windows 形式（`C:/...`，脚本已设 `MSYS_NO_PATHCONV=1`，
 fastboot 是 Windows 程序不认 `/c/...`）；`FB_T` 默认 30 秒，传系统卷（97 秒）必须放大。
@@ -150,14 +148,14 @@ fastboot 是 Windows 程序不认 `/c/...`）；`FB_T` 默认 30 秒，传系统
 ### 3.1 固件目录与 MD5
 
 `firmware/` 放的是 **iOS 16.5 20F66（iPhone10,3 / iPhone10,6）IPSW**（6.16 GB）。
-它是一键启动**不需要**的——启动读的是 `boot/system.apfs`；它只在你想从零重建系统卷时才用到，
-所以**一键启动默认完全不碰固件**（`FIRMWARE=1` 才会下载/校验）。
+它是一键启动**不需要**的——启动读的是 `boot/system.apfs`；它只在你想从零重建系统卷时才用到。
+**`boot-one.*` 完全不碰固件**：不下载、不校验、也不调用 `fetch-firmware.*`。
 
 > **GitHub 仓库不包含 firmware/ 和 boot/system.apfs**（体积 + 版权限制）。克隆仓库后：
 > 只启动、体验现有镜像 → 什么都不用做（`-NoSystem` 用载荷自带 root.apfs，或自备 system.apfs）；
 > 要完整桌面 → 按 §5.4 用本机固件构建 `system.apfs`（这一步才需要 IPSW）。
 
-- 文件缺失或损坏时，两个一键启动脚本会先调用 `fetch-firmware.*` 自动补全：
+- 需要 IPSW 时**手动**运行独立工具 `fetch-firmware.*`：
   `curl` 断点续传（`.part`）、最多 3 次重试，下载完按 **大小 6,165,698,198 + MD5**
   校验，通过后才改名并写 `.verified`；任一步失败都**不会**拿坏文件去构建。
 - 基准值：`MD5 f87b4bd6f3c86fb174ce017b5a5ca97b`，同目录 `*.ipsw.md5` 可直接 `md5sum -c`。
@@ -177,8 +175,7 @@ FORCE=1 bash fetch-firmware.sh
 
 - 校验通过后写入 `firmware\.verified`，后续启动直接命中标记、不再重复算 6 GB 的 MD5；
   删掉该标记即可强制重新校验。
-- 固件目录可用 `-Dir` / `DIR=` 改到别处。固件获取失败只会打印警告，**不会阻止启动**；
-  确实要跳过这一步，用 `-SkipFirmware` / `SKIP_FIRMWARE=1`。
+- 固件目录可用 `-Dir` / `DIR=` 改到别处。工具失败只打印错误、不留半成品，且**与启动无关**。
 - 重建系统卷（需要 Linux + 7z + APFS 工具链）：
 
 ```bash
@@ -429,7 +426,7 @@ bc15b275…  boot/system.apfs      2,492,223,488 B   （本地交付包；GitHub
 ```
 
 固件不随仓库发布（6.16 GB，版权原因）：本地交付包里的 IPSW 用 `firmware/*.ipsw.md5` 校验，
-基准 MD5 为 `f87b4bd6f3c86fb174ce017b5a5ca97b`；一键启动默认**不**下载它（`FIRMWARE=1` 才下载）。
+基准 MD5 为 `f87b4bd6f3c86fb174ce017b5a5ca97b`；一键启动**不下载**它（启动流程不碰固件，见 §3.1）。
 
 **Windows 检出的两个 `.dts` 校验会报 FAILED**：`core.autocrlf` 检出时把 LF 换成 CRLF 所致，
 内容未变（`git diff` 为空即一致）；在 Linux 下校验或以 `git status` 为准。
