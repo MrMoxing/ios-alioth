@@ -40,18 +40,31 @@
  * then to make files. A store that was torn or is half a different archive therefore leaves
  * /private/var as init made it rather than half filled.
  *
- * What is left out: sockets and devices, which the daemons of a new boot make for themselves, and
- * the directories in SKIP below, which hold what only this boot can mean (its runtime sockets, its
- * swap, its logs) or what is grafted from a read-only image at every boot anyway.
+ * What is left out: sockets and devices, which the daemons of a new boot make for themselves, the
+ * directories in SKIP below, which hold what only this boot can mean (its runtime sockets, its
+ * swap, its logs) or what is grafted from a read-only image at every boot anyway, and every
+ * directory called Caches or Logs, which iOS remakes and which -- one per container -- were most
+ * of the thirty-odd megabytes a first save came to.
  */
 #include "mini.h"
 
 #define BLOCK           4096
 #define BUFFER          (4u << 20)              /* the loader's own buffer: one request a write */
-#define STORE_AT        8589934592LL            /* darwin's block 2097152: past the cryptexes, with room to spare */
-#define SLOT_BYTES      0x80000000LL            /* 2 GiB a slot, two slots */
-#define SLOTS           2
-#define DEVICE          "/dev/rufs_darwin"
+/*
+ * Where the store lives: the tail of logdump, because this phone has no darwin (that partition
+ * was carved on some phones and not others, and the loader serves its tail when it is there).
+ * The loader writes the kernel's log into logdump's first megabytes and nothing reads the rest,
+ * so the store starts 8 MB in and takes two 28 MiB slots -- the whole 56 MB the loader offers
+ * (blocks 2048..16383), in the port's own dump area, never in Android's userdata. A tree that has
+ * run for a while packs to about 24 MiB once the caches, the logs and the system's own guessing
+ * about the user (DuetExpertCenter) are left out, so a slot holds it with room to spare and the
+ * other slot keeps the generation before: a save cut short loses itself and nothing else. The
+ * largest entries are reported with each save (print_big), so what grows shows up as it grows.
+ */
+#define STORE_AT        8388608LL               /* logdump's block 2048: past the log */
+#define SLOT_BYTES      0x1C00000LL             /* 28 MiB a slot: two of them fill the window (56 MiB) */
+#define SLOTS           2                       /* the one not holding the newest archive is the one written */
+#define DEVICE          "/dev/rufs_logdump"
 #define ROOT            "/private/var"
 #define MAX_PATH        1024
 #define MAX_DEPTH       32
@@ -73,6 +86,7 @@ static const char *const SKIP[] = {
 	"vm",                   /* the compressor's swap */
 	"log", "logs",          /* what the last boot said */
 	"db/diagnostics", "db/uuidtext",        /* logd's archive: tens of MB a boot, and remade */
+	"mobile/Library/DuetExpertCenter",      /* its streams: 8 MB of what the system guessed about the user */
 	"jb",                   /* the package prefix, grafted from the read-only image at every boot */
 	NULL,
 };
@@ -296,7 +310,10 @@ out_flush(int last)
 		}
 	}
 	if (at + (off_t)n > stream_limit) {
-		printf("var_store: the archive does not fit in its slot: nothing more is written\n");
+		printf("var_store: the archive does not fit in its slot: at %llu, %llu more wanted, the "
+		    "slot ends at %llu (%llu bytes of store a slot)\n",
+		    (unsigned long long)at, (unsigned long long)n, (unsigned long long)stream_limit,
+		    (unsigned long long)SLOT_BYTES);
 		return 0;
 	}
 	/*
@@ -489,6 +506,92 @@ static char path[MAX_PATH];               /* the whole path, under ROOT */
 static struct { uint64_t ino; char path[LINK_PATH]; } *links;
 static uint64_t skipped_kinds, skipped_big;
 
+/*
+ * The entries that take the most room. A save that does not fit its slot is the one question this
+ * answers: which of them it is, so that what holds nothing a boot cannot remake can be left out by
+ * name instead of guessed at.
+ */
+#define BIG_N 8
+static struct { char name[96]; uint64_t bytes; } big[BIG_N];
+
+static void
+note_big(const char *relative, uint64_t bytes)
+{
+	int worst = -1;
+
+	if (bytes < 65536) {
+		return;
+	}
+	for (int i = 0; i < BIG_N; i++) {
+		if (big[i].bytes == 0) {
+			worst = i;
+			break;
+		}
+		if (worst < 0 || big[i].bytes < big[worst].bytes) {
+			worst = i;
+		}
+	}
+	if (worst < 0 || big[worst].bytes >= bytes) {
+		return;
+	}
+	{
+		size_t n = strlen(relative);
+
+		if (n >= sizeof(big[worst].name)) {
+			n = sizeof(big[worst].name) - 1;
+		}
+		memcpy(big[worst].name, relative, n);
+		big[worst].name[n] = 0;
+	}
+	big[worst].bytes = bytes;
+}
+
+static void
+print_big(void)
+{
+	for (int i = 0; i < BIG_N; i++) {
+		uint64_t most = 0;
+		int pick = -1;
+
+		for (int j = 0; j < BIG_N; j++) {
+			if (big[j].bytes > most) {
+				most = big[j].bytes;
+				pick = j;
+			}
+		}
+		if (pick < 0) {
+			return;
+		}
+		printf("var_store:   %llu KB  %s\n", (unsigned long long)(big[pick].bytes >> 10),
+		    big[pick].name);
+		big[pick].bytes = 0;
+	}
+}
+
+/*
+ * A directory called Caches or Logs anywhere under the volume: iOS remakes both, and they are the
+ * bulk of a tree that has run for a while -- every container keeps its own, so a rule by name is
+ * the only one that reaches them (the SKIP list above names whole paths).
+ */
+static int
+is_skipped_kind(const char *relative)
+{
+	const char *p = relative;
+
+	for (;;) {
+		const char *end = strchr(p, '/');
+		size_t n = end != NULL ? (size_t)(end - p) : strlen(p);
+
+		if ((n == 6 && strncmp(p, "Caches", 6) == 0) || (n == 4 && strncmp(p, "Logs", 4) == 0)) {
+			return 1;
+		}
+		if (end == NULL) {
+			return 0;
+		}
+		p = end + 1;
+	}
+}
+
 static int
 is_skipped(const char *relative)
 {
@@ -497,7 +600,7 @@ is_skipped(const char *relative)
 			return 1;
 		}
 	}
-	return 0;
+	return is_skipped_kind(relative);
 }
 
 /* The name this inode was first met under, if it has one; otherwise this one is remembered. */
@@ -762,8 +865,13 @@ pack_tree(const char *relative)
 	if (lstat(path, &st) != 0) {
 		return 1;
 	}
-	if (relative[0] != 0 && !pack_one(relative, &st)) {
-		return 0;
+	if (relative[0] != 0) {
+		uint64_t before = (uint64_t)at + buffered;
+
+		if (!pack_one(relative, &st)) {
+			return 0;
+		}
+		note_big(relative, (uint64_t)at + buffered - before);
 	}
 	if ((st.st_mode & S_IFMT) != S_IFDIR || (relative[0] != 0 && is_skipped(relative))) {
 		return 1;
@@ -829,6 +937,7 @@ save(void)
 	    best < 0 ? 0ULL : (unsigned long long)old.generation);
 
 	/* the slot's header first, so that a save cut short cannot leave an old header over a new archive */
+	memset(big, 0, sizeof(big));
 	memset(block, 0, sizeof(block));
 	if (!device_write(slot_at(slot), block, BLOCK)) {
 		return 0;
@@ -844,6 +953,8 @@ save(void)
 	skipped_kinds = skipped_big = 0;
 	strcpy(path, ROOT);
 	if (!pack_tree("") || !out_flush(1)) {
+		printf("var_store: what this save packed, the largest it met first:\n");
+		print_big();
 		return 0;
 	}
 	memset(&h, 0, sizeof(h));
@@ -883,6 +994,8 @@ save(void)
 	printf("var_store: %llu blocks into the flash, %llu left alone (they held this already)%s\n",
 	    (unsigned long long)written_blocks, (unsigned long long)skipped_blocks,
 	    unsorted_dirs ? " (a directory was too big to put in order)" : "");
+	printf("var_store: what it holds, the largest first:\n");
+	print_big();
 	return 1;
 }
 
@@ -1312,13 +1425,18 @@ watch(int seconds)
 	}
 }
 
-/* A line saying when, for a run to leave behind and the next one to find. */
+/*
+ * A line saying when, for a run to leave behind and the next one to find. The file is made anew
+ * each time rather than appended to: a name made in this ramfs with O_APPEND is not in the
+ * directory afterwards -- the write answers the bytes and the next open of the same path says
+ * ENOENT, so nothing packs it and nothing finds it. With O_TRUNC the entry is there.
+ */
 static int
 stamp(const char *where)
 {
 	struct timeval tv = { 0, 0 };
 	char line[256];
-	int out_fd = open(where, O_WRONLY | O_CREAT | O_APPEND, 0644);
+	int out_fd = open(where, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 	int n;
 
 	if (out_fd < 0) {
@@ -1354,6 +1472,29 @@ stamp(const char *where)
 	return 1;
 }
 
+/* What a file of the volume holds: a run's own way of seeing that the last one came back. */
+static int
+cat(const char *where, int bytes)
+{
+	char buf[512];
+	int in_fd = open(where, O_RDONLY, 0);
+	int n;
+
+	if (in_fd < 0) {
+		printf("var_store: %s: %s\n", where, strerror(errno));
+		return 0;
+	}
+	while (bytes > 0 && (n = (int)read(in_fd, buf, sizeof(buf))) > 0) {
+		if (n > bytes) {
+			n = bytes;
+		}
+		write(1, buf, (size_t)n);
+		bytes -= n;
+	}
+	close(in_fd);
+	return 1;
+}
+
 int
 main(int argc, char **argv, char **envp)
 {
@@ -1364,6 +1505,10 @@ main(int argc, char **argv, char **envp)
 	crc_init();
 	if (strcmp(what, "stamp") == 0) {
 		return stamp(argc > 2 ? argv[2] : "/private/var/redwood-stamp") ? 0 : 1;
+	}
+	if (strcmp(what, "cat") == 0) {
+		return cat(argc > 2 ? argv[2] : "/private/var/redwood-stamp",
+		    argc > 3 ? (int)parse_number(argv[3]) : 256) ? 0 : 1;
 	}
 	buffer = mmap(NULL, BUFFER, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
 	links = mmap(NULL, LINKS * sizeof(*links), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);

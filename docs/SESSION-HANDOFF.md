@@ -1217,3 +1217,89 @@ loader 自己会往内核命令行追加 `ufs_shared_pa=0x…`（`loader.c:3008`
    userdata。需要重编 loader（UEFI）+ 改内核的边界检查。
 2. **借 `oops`（16 MB，Qualcomm 崩溃转储区）**：同上，但空间更小。
 3. **真切 darwin**：从 userdata 尾部离线重分区（要缩 f2fs），风险最高，不建议现在做。
+
+### 13.14 持久化（进行中）：写窗口已通到 loader，写入路径会把 loader 卡死（11-03 15:xx）
+
+**已完成并真机确认的部分**：
+- loader 侧：新增 `block_is_store()` —— 找不到 darwin 时接受 **logdump 的 2048..16383 块**（8 MB 起、
+  56 MB 窗口），身份校验与 darwin 同级（名字、GPT 起止 LBA 81920..98303、16384 块、块大小 4096、
+  unit 0、可写），任一不符则本次一个字节都不写。真机日志实证：
+  `ufs: no darwin on this phone: the store goes into logdump (LBA 81920..98303 of unit 0), its blocks from 2048 on`
+- 窗口起点经共享页新增的 `write_first` 传给内核（loader 侧 `block_write_first` 变量；内核侧
+  `ufs_write_first`），内核的写检查从写死 darwin 常量改为按 `write_first` 认 darwin 或 logdump。
+- `var_store.c` 改成 `DEVICE=/dev/rufs_logdump`、`STORE_AT=8 MB`、`SLOT_BYTES=24 MB`（两槽 = 48 MB，
+  末尾 8 MB 余量）。root.apfs 里 `var_store` 二进制已带 `rufs_logdump`。
+- 新 loader 已打进 `boot/alioth-boot.img.new`（md5 `1d886792…`），用仓库的 3 MB FD + 从旧镜像里取出
+  的 alioth DTB 重新打包（Mu-Silicium 构建树已清，脚本见 `ubuntu/unpack-boot.py`）。
+
+**卡住的地方**：`ufs=2 ufs_write=1 var_store=1` 跑起来后，**loader 的 USB 服务在 `oem run` 之后即不可用**
+（`fastboot get_staged`/`reboot` 全是 `Write to device failed (no link)`，但 `fastboot devices` 仍能看到
+`xnuloader`），手机只能长按电源强制重启。不带 `ufs_write`/`var_store` 的 `ufs=2` 跑法是好的（13.13 的
+df10 就是那样跑出来的日志）。
+
+**下一步（按怀疑程度排序）**：
+1. **先用一个「只写 4 KB」的探针**（不跑 var_store），确认 loader 的写路径本身能不能回话；能，则问题在
+   var_store 的写量（archive 若上百 MB，经 4 MB 缓冲 + 逐块读回校验，几十秒起步，可能超过
+   `var_save_ms` 并在返回途中把 loader 拖住）。
+2. 若写路径本身有问题：检查 loader 的 `block_write` 分支在 logdump 上的 `write_blocks` +
+   `read_blocks` 读回校验（logdump 的 BlockIo 可能不支持写或读回）。
+3. var_store 侧可先只保存 `/private/var/mobile/Library/Preferences`（几 MB）验证闭环，再放开整树。
+
+### 13.15 数据卷持久化：/private/var 跨重启保留（11-03 15:5x，真机验证）
+
+**一句话**：`/private/var` 不再每次开机归零。运行中写下的东西在返回 loader 前被打包写进
+**logdump 的 8–64 MB**（手机自己的转储分区，完全不碰 Android 的 userdata），下次开机由
+init 解包回来。真机连跑六轮，generation 1→4 在槽 0/槽 1 之间轮换，每轮载入都解出约一千个文件。
+
+**测量**（`runs/persist5..15-full.bin`，全部真机）：
+
+| 事实 | 数字 |
+|---|---|
+| 写请求 | 8–10 次，24.5–29.5 MB，loader 读回一致，**0 次拒绝** |
+| 存档头 | `RDWVAR` 落在 8 MB（logdump 的 block 2048），`header right`，crc 有值 |
+| 一次存档 | 10,600 条目 / 约 24.5 MB（裁掉 caches/logs/Duet 之后；之前 33.7 MB） |
+| 载入 | `5,088 directories, 1,011 files (23,607,719 bytes), 2 links back in /private/var` |
+| 对照 | 全新启动的 var 只有骨架 **12 个种子文件**（`userland/var/mobile/...`） |
+| 读回 | `var_store cat .../MobileContainerManager/containers.sqlite3` → `SQLite format 3` |
+| 轮换 | slot 0 gen 1 → slot 1 gen 2 → slot 0 gen 3 → slot 1 gen 4 |
+
+**五个必须记住的坑**（都是这轮踩出来的）：
+
+1. **logdump 的日志区不清零**。loader 每次从偏移 0 写 `len` 字节，之后是上一轮的残留。读日志
+   必须按**第一个** `== END OF LOG ==` 截断——这轮就被骗过一次，把上一轮的 `No such file` 当成
+   了这一轮的结果（`tools/logdump.py` 已按此处理）。
+2. **日志可以从 Android 直接读**，不需要 `fastboot get_staged`：
+   `adb exec-out 'su -c "dd if=/dev/block/by-name/logdump bs=1M count=2"'`。这是本轮最大的
+   调试突破——之前几次「loader 卡死、日志拿不到」其实都能这样读到。
+3. **槽容量是硬门槛**。`newest()` 会检查 `h->bytes > SLOT_BYTES - 4096`，超出就判该槽无效，
+   load 打印 `no store yet: /private/var stays as init made it`（而 `show` 仍说 `header right`）。
+   所以**调整槽大小会让旧存档立刻失效**：把 56 MiB 单槽改成 2×28 MiB 那一次就是这样。
+4. **存档曾 33.7 MB，装不进两个槽**。最大贡献者由新加的 `print_big` 报出来：
+   `mobile/Library/DuetExpertCenter/streams/...` 8 MB（系统对用户的猜测，可丢）、Keychains 2.4 MB
+   （要留）。裁掉 Caches/Logs/Duet 后降到 24 MiB，2×28 MiB 就有余量了。
+5. **ramfs 的名字查找有毛病**：`var_store stamp` 用 O_APPEND 或 O_TRUNC 创建的文件，写完报
+   `29 bytes added`，但**再按名字打开就是 ENOENT**（readdir 能列到、能进存档，只是查不到）。
+   同理 `vol_ls` 在 job 里对 `/private/var` 的 `statfs` 直接 ENOENT，可 `var_store` 同一路径读写正常。
+   所以**别用 stamp/vol_ls 当验证探针**，用 `var_store cat` 读 iOS 自己创建的文件。
+
+**代码改动**（都在 `main`，已随本轮提交）：
+- `userland/src/var_store.c`：`DEVICE=/dev/rufs_logdump`、`STORE_AT=8 MB`、`SLOT_BYTES=28 MiB`、
+  `SLOTS=2`；新增 `is_skipped_kind()`（按名字跳过任何 `Caches`/`Logs`）、`note_big()/print_big()`
+  （报出最大的 8 个条目）、`cat` 子命令；`stamp` 改 O_TRUNC。
+- `xnuloader/loader.c`：`block_is_store()` —— 没有 darwin 时接受 logdump 的 2048..16383 块，
+  身份校验与 darwin 同级；窗口起点经共享页 `write_first` 传给内核。
+- `xnu/files/bsd/dev/redwood_ufs.c`：`ufs_write_first` 按 loader 给的起点放行写；`/dev/rufs_logdump`
+  可写；`var_save_ms` 默认 20 秒（实测一次保存 1.1–1.4 秒就够）。
+- `tools/logdump.py`：从 Android 读日志（按会话截断）与查存档头。
+- `ubuntu/build-persist2.sh`：重建持久化场景 + 载荷（`loader_return_after=100`，让保存在
+  日志可读之前完成）。
+
+**默认已开启**：`boot/run-payload.bin` 的命令行现在是 `ufs=2 ufs_write=1 var_store=1`，
+`boot/alioth-boot.img` 换成了带新 loader 的版本，所以正常启动就带持久化。
+
+**还没有的**：这不是可写的 APFS 数据卷——只有 56 MB 的打包副本，装的是"小而重要"的东西
+（prefs、keychain、容器元数据、图标布局），装 App、存照片不在其能力内；`watch` 的周期保存默认关闭
+（一次保存约 1.4 秒 + 24 MB 闪存写），只在返回 loader 时保存一次。
+
+**下一步**：语言/壁纸/watchdog 之后可以真正"改了就不回退"——中文语言实验、壁纸选择、Wi-Fi
+密码都能跨重启保留，这几个目标的验证路径因此才通。

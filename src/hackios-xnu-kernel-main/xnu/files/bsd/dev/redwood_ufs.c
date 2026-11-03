@@ -78,6 +78,14 @@ extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);   /* osfmk/arm
 #define UFS_WRITE_FIRST    2042368ULL                  /* darwin's blocks of 4096 */
 #define UFS_DARWIN_FIRST   25374720ULL                 /* its first LBA on the unit, as the GPT has it */
 #define UFS_DARWIN_BLOCKS  5242875ULL
+/*
+ * The store when the phone has no darwin (this port's partition was carved on some, not all):
+ * logdump's tail, past the log the loader writes into its first megabytes. The loader offers it
+ * with write_first = UFS_STORE_FIRST, and the geometry below is what it checked before it did.
+ */
+#define UFS_STORE_FIRST    2048ULL                     /* logdump's blocks of 4096: 8 MB in */
+#define UFS_LOGDUMP_FIRST  81920ULL                    /* its first LBA on the unit */
+#define UFS_LOGDUMP_BLOCKS 16384ULL                    /* 64 MB */
 
 struct loader_block_part {
 	char name[36];
@@ -204,6 +212,7 @@ static int ufs_var_busy_pid;
 
 /* ufs_write=1 and the one partition it is for: everything else answers EROFS as it always did */
 static int ufs_write_part = -1;
+static uint64_t ufs_write_first = UFS_WRITE_FIRST;      /* the first block of it a write may reach */
 static volatile bool ufs_write_busy;            /* a write of ours has this kernel's list out: not a failure */
 static bool ufs_write_out, ufs_write_was_native;        /* the list is out for writing, and was in before */
 static uint64_t ufs_writes, ufs_write_bytes, ufs_write_errors, ufs_write_refused;
@@ -603,7 +612,7 @@ ufs_write(uint32_t part, uint64_t offset, const uint8_t *src, uint64_t len)
 	if (len == 0 || offset % nbs != 0 || len % nbs != 0) {
 		return EINVAL;          /* whole blocks only: nothing is read before a write */
 	}
-	if (offset / nbs < UFS_WRITE_FIRST || offset > ufs_part_bytes(part) ||
+	if (offset / nbs < ufs_write_first || offset > ufs_part_bytes(part) ||
 	    len > ufs_part_bytes(part) - offset) {
 		/* the iOS volume, the cryptexes, and anything past the partition's end: never */
 		ufs_write_refused++;
@@ -1543,14 +1552,33 @@ redwood_ufs_init(void)
 	if (PE_parse_boot_argn("ufs_write", &check, sizeof(check)) && check == 1) {
 		uint32_t offered = ufs_page->write_part_plus_one;
 
-		if (offered == 0 || offered > ufs_parts || ufs_page->write_first != UFS_WRITE_FIRST) {
+		if (offered == 0 || offered > ufs_parts ||
+		    (ufs_page->write_first != UFS_WRITE_FIRST && ufs_page->write_first != UFS_STORE_FIRST)) {
 			printf("ufs: the loader offers no partition to write into (ufs_write=1 on its command "
 			    "line too, and a loader that knows about writes)\n");
 		}
-		for (uint32_t i = 0; offered != 0 && i < ufs_parts; i++) {
-			const char *why = NULL;
+		ufs_write_first = ufs_page->write_first;
+		{
+			char line[128];
+			extern void loader_log_line(const char *line);
 
-			if (strncmp((const char *)ufs_page->part[i].name, "darwin", 7) != 0) {
+			snprintf(line, sizeof(line), "ufs: write: offered %u of %u, write_first %llu",
+			    offered, ufs_parts, (unsigned long long)ufs_write_first);
+			loader_log_line(line);
+		}
+		for (uint32_t i = 0; offered != 0 && offered <= ufs_parts && i < ufs_parts; i++) {
+			const char *why = NULL;
+			const char *want_name = "darwin";
+			uint64_t want_first = UFS_DARWIN_FIRST, want_blocks = UFS_DARWIN_BLOCKS;
+			const char *have_name = (const char *)ufs_page->part[i].name;
+
+			if (ufs_write_first == UFS_STORE_FIRST) {
+				/* no darwin: the loader said logdump's tail is the store */
+				want_name = "logdump";
+				want_first = UFS_LOGDUMP_FIRST;
+				want_blocks = UFS_LOGDUMP_BLOCKS;
+			}
+			if (strcmp(have_name, want_name) != 0) {
 				continue;
 			}
 			if (i != offered - 1) {
@@ -1562,25 +1590,35 @@ redwood_ufs_init(void)
 				 * has compared with the loader's reads; the device path this firmware gives
 				 * says no logical unit number at all, so part[].lun is 0xff for every unit */
 				why = "it is not on the first logical unit";
-			} else if (ufs_page->part[i].start_lba != UFS_DARWIN_FIRST) {
+			} else if (ufs_page->part[i].start_lba != want_first) {
 				why = "it does not begin where it did";
-			} else if (ufs_page->part[i].blocks != UFS_DARWIN_BLOCKS) {
+			} else if (ufs_page->part[i].blocks != want_blocks) {
 				why = "it is not the size it was";
 			} else if (ufs_page->part[i].block_size != 4096) {
 				why = "its blocks are not 4096 bytes";
 			}
 			if (why != NULL) {
-				printf("ufs: darwin: no write will be asked for: %s\n", why);
+				printf("ufs: %s: no write will be asked for: %s\n", want_name, why);
 				continue;
 			}
 			ufs_write_part = (int)i;
 		}
 		if (ufs_write_part >= 0) {
-			printf("ufs: /dev/rufs_darwin takes writes, whole blocks from %llu on (%llu MB of it); "
-			    "everything else of the storage is read only\n", UFS_WRITE_FIRST,
-			    (UFS_DARWIN_BLOCKS - UFS_WRITE_FIRST) * 4096 >> 20);
+			printf("ufs: /dev/rufs_%s takes writes, whole blocks from %llu on (%llu MB of it); "
+			    "everything else of the storage is read only\n",
+			    ufs_write_first == UFS_STORE_FIRST ? "logdump" : "darwin", ufs_write_first,
+			    ((ufs_write_first == UFS_STORE_FIRST ? UFS_LOGDUMP_BLOCKS : UFS_DARWIN_BLOCKS) -
+			    ufs_write_first) * 4096 >> 20);
 		} else {
-			printf("ufs: nothing takes writes: darwin is not among the partitions\n");
+			printf("ufs: nothing takes writes: neither darwin nor logdump is among the partitions\n");
+		}
+		{
+			char line[128];
+			extern void loader_log_line(const char *line);
+
+			snprintf(line, sizeof(line), "ufs: write: the partition chosen is %d (store %d)",
+			    ufs_write_part, ufs_write_first == UFS_STORE_FIRST);
+			loader_log_line(line);
 		}
 	}
 

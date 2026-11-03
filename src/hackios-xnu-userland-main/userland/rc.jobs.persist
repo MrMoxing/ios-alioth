@@ -1,23 +1,18 @@
 # Commands run by the launchd job com.redwood.demo (see com.redwood.demo.plist).
-# The data volume of iOS kept between boots (var_store=1 ufs_write=1; src/var_store.c): what the
-# store held when this boot began, how much room the volume has, the line every run before this one
-# left in /private/var and the names SpringBoard had made by then with the seconds they were
-# written; then this run's own line, and after two and a half minutes of iOS left to itself the
-# same names again.
-# Nothing here saves. The job com.redwood.varstore stays for the run and writes the volume into the
-# flash when the kernel says the run is ending -- which is the point: a run that was never told to
-# save keeps what it wrote all the same. Run it twice over, with ./xl reboot in between; the second
-# run's output holds the first run's line and the first run's seconds.
+# What the store held when this boot began, whether a file of the tree came back, and the line the
+# run before left in /private/var/mobile: a line with an earlier second is that boot's volume coming
+# back. Then this run's own line, and the file again a minute later.
+#
+# The marker lives under mobile/, not at the root of the volume: a name made in the root of the
+# ramfs cannot be looked up again afterwards (stamp creates it and reports the bytes, and the next
+# open of the same path answers ENOENT), while everything iOS keeps lives in subdirectories and
+# comes back through them. Nothing here saves: the job com.redwood.varstore does, when the kernel
+# says the run is ending.
 /redwood/bin/var_store show
-/redwood/bin/vol_ls fs /private/var
-/redwood/bin/vol_ls cat /private/var/redwood-stamp 4096
-/redwood/bin/vol_ls ls /private/var/mobile/Library/SpringBoard
-/redwood/bin/var_store stamp /private/var/redwood-stamp
-sleep 150
-/redwood/bin/vol_ls ls /private/var/mobile/Library/SpringBoard
-/redwood/bin/vol_ls ls /private/var/mobile/Library
-/redwood/bin/vol_ls cat /private/var/redwood-stamp 4096
+/redwood/bin/var_store cat /private/var/root/Library/MobileContainerManager/containers.sqlite3 16
+/redwood/bin/var_store cat /private/var/mobile/redwood-stamp 256
+/redwood/bin/var_store cat /private/var/mobile/Library/Preferences/.GlobalPreferences.plist 96
+/redwood/bin/var_store stamp /private/var/mobile/redwood-stamp
+sleep 60
+/redwood/bin/var_store cat /private/var/mobile/redwood-stamp 256
 /redwood/bin/var_store show
-# (what the saver then did, and how many writes went into darwin, is at the end of the run: the
-#  kernel's "var_store: the run is ending" and the loader's "ufs: N writes into darwin ... read
-#  back the same; K refused")

@@ -1507,6 +1507,18 @@ ufs_survey(void)
 #define BLOCK_DARWIN_UNIQ  { 0xfd6854ad, 0x24aa, 0x4fc3, { 0x94, 0xfe, 0x29, 0x01, 0x16, 0x85, 0x8d, 0x68 } }
 
 /*
+ * When there is no darwin (this port's partition was carved on some phones and not others), the
+ * store goes into the tail of logdump instead: the loader writes the kernel's log into its first
+ * megabytes and nothing reads the rest, so blocks 2048.. of it -- 8 MB in, 56 MB of room -- are as
+ * free as darwin would be, and they are the phone's own dump partition, never Android's data.
+ * The identity is checked as strictly as darwin's: the same partition of the GPT, of the same size
+ * and in the same place, so a firmware that lays those out differently gets no writes at all.
+ */
+#define BLOCK_STORE_FIRST  2048ULL                     /* logdump's blocks of 4096: past the log */
+#define BLOCK_LOGDUMP_FIRST 81920ULL                   /* its first and last LBA of unit 0 */
+#define BLOCK_LOGDUMP_LAST  98303ULL
+
+/*
  * The partitions first, then the logical units they are on (BLOCK_PART_UNIT, named unit0, unit1,
  * ... in the order UEFI lists them). Each partition says which of those it is on and where it
  * begins there, so that a reader of the units themselves -- the kernel's own UFS driver -- finds
@@ -1590,6 +1602,7 @@ static efi_block_io *block_bios[BLOCK_MAX_PARTS];
 static int block_enabled;
 static int block_write_requested;       /* ufs_write=1 on the command line */
 static int block_write_part = -1;       /* the only partition a write may reach; -1: none, writes refused */
+static uint64_t block_write_first = BLOCK_WRITE_FIRST;  /* its first block a write may reach */
 static uint64_t block_writes, block_writes_refused, block_write_bytes;
 
 /* the bytes of a device path before its end node */
@@ -1877,6 +1890,40 @@ block_is_darwin(const efi_partition_info *info, const efi_block_io *bio, const s
 	return 1;
 }
 
+/*
+ * The fallback store: logdump's tail, when darwin is not on this phone. Same checks as darwin's
+ * (the partition this firmware has, of the size and place this port expects, on unit 0, writable),
+ * and the same refusal to guess: one field out of place and this run writes nothing at all.
+ */
+static int
+block_is_store(const efi_partition_info *info, const efi_block_io *bio, const struct loader_block_part *bp)
+{
+	static const char name[] = "logdump";
+	const char *why = NULL;
+
+	for (unsigned i = 0; i < sizeof(name); i++) {
+		if (bp->name[i] != name[i]) {
+			return 0;               /* another partition: nothing to say about it */
+		}
+	}
+	if (info->start_lba != BLOCK_LOGDUMP_FIRST || info->end_lba != BLOCK_LOGDUMP_LAST) {
+		why = "it does not begin and end where this port expects logdump";
+	} else if (bp->unit != 0) {
+		why = "it is not on the first logical unit";
+	} else if (bp->block_size != 4096 || bp->blocks != BLOCK_LOGDUMP_LAST - BLOCK_LOGDUMP_FIRST + 1) {
+		why = "its blocks are not what they were";
+	} else if (bio->media->read_only) {
+		why = "UEFI gives it out read only";
+	}
+	if (why != NULL) {
+		print("ufs: logdump: no write will be served: %s\n", why);
+		return 0;
+	}
+	print("ufs: no darwin on this phone: the store goes into logdump (LBA %d..%d of unit 0), "
+	    "its blocks from %d on\n", info->start_lba, info->end_lba, BLOCK_STORE_FIRST);
+	return 1;
+}
+
 static void
 block_start(void)
 {
@@ -1947,8 +1994,14 @@ block_start(void)
 				}
 			}
 		}
-		if (block_write_requested && block_is_darwin(info, bio, bp)) {
-			block_write_part = (int)block_shared.parts;
+		if (block_write_requested) {
+			if (block_is_darwin(info, bio, bp)) {
+				block_write_first = BLOCK_WRITE_FIRST;
+				block_write_part = (int)block_shared.parts;
+			} else if (block_is_store(info, bio, bp)) {
+				block_write_first = BLOCK_STORE_FIRST;
+				block_write_part = (int)block_shared.parts;
+			}
 		}
 		block_bios[block_shared.parts++] = bio;
 		if (block_probe_requested && bp->name[0] == 'd' && bp->name[1] == 'a' && bp->name[2] == 'r' &&
@@ -1996,7 +2049,7 @@ block_start(void)
 	block_writes = block_writes_refused = block_write_bytes = 0;
 	if (block_write_part >= 0) {
 		block_shared.write_part_plus_one = (uint32_t)block_write_part + 1;
-		block_shared.write_first = BLOCK_WRITE_FIRST;
+		block_shared.write_first = block_write_first;
 	}
 	block_shared.magic = BLOCK_MAGIC;
 	block_shared.version = BLOCK_VERSION;
@@ -2123,7 +2176,7 @@ block_poll(void)
 			s = 0x800000000000000FULL;      /* EFI_ACCESS_DENIED */
 			bytes = 0;
 		} else if (op == BLOCK_OP_WRITE) {
-			if (block_write_part < 0 || part != (uint32_t)block_write_part || lba < BLOCK_WRITE_FIRST) {
+			if (block_write_part < 0 || part != (uint32_t)block_write_part || lba < block_write_first) {
 				/* not darwin, or not past what the build writes from the computer: never */
 				if (block_writes_refused++ < 8) {
 					print("ufs: a write of %d blocks from %d of %s: REFUSED\n", count, lba,
