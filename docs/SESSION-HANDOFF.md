@@ -901,7 +901,7 @@ cpufreq=1 bootcpu=7 cpus=8 adreno_soc=a650 adreno=1 adreno_watch=10
 > **每步只做一件事 + 让内核正常跑完（panic 也算正常结束）**，日志才会被完整写出；
 > 只跑 20 s 是不够的（loader 要 50 s 静默才判 HUNG，而别的核的心跳会阻止它判 HUNG）。
 
-### 13.4 下一步（第 5 步）
+### 13.4 下一步（第 5 步）（已被 13.5 取代）
 
 按厂商 `gdsc.c` + `pcie-qcom.c` 的顺序：①GDSC 清 `SW_COLLAPSE` 并等 `POWER_ON`(bit31)；
 ②`0x52008 |= 0x3f` 投六路时钟并确认 halt 状态；③（复位已释放，无需动）；
@@ -910,3 +910,266 @@ cpufreq=1 bootcpu=7 cpus=8 adreno_soc=a650 adreno=1 adreno_watch=10
 产物：`k40-build/run-payload-pcie1.bin`…`-pcie5.bin`、`run-payload.bin` 仍是 iOS。
 另注：`SYS=` 空（无系统镜像）时内核会在 `launchd` exec 处 panic（`errno 2`），这是正常的“没系统可起”，
 不影响驱动日志（日志在 `p1a.ld.bin` 里，21600 字节处）。
+
+### 13.5 厂商权威驱动修正 + 步骤 12–15（2026-10-31 深夜，离线完成，真机待验证）
+
+**权威驱动修正（重要，推翻 13.1/13.4 的假设）**：
+- 厂商 4.19 树的 `drivers/pci/controller/dwc/pcie-qcom.c`（1322 行）**不含 SM8250/2.7.0 变体**
+  （ops 只有 2.1.0/1.0.0/2.3.2/2.4.0/2.3.3）——13.1 末尾"偏移取自 pcie-qcom.c"一句是错的。
+- 真机实际跑的权威驱动是 **`drivers/pci/controller/pci-msm.c`**（≈6700 行，msm_pcie）。
+  `alioth_pcie.c` 步骤 5–15 已按它逐函数对齐：`msm_pcie_enable`、`msm_pcie_link_train`、
+  `msm_pcie_config_controller`、`msm_pcie_cfg_bdf`、`pcie_phy_is_ready`（源码在
+  `E:\Productivity\WorkBuudy\iOSForK40_2\src\Xiaomi_Kernel_OpenSource-alioth-r-oss`）。
+- 由此带来两处**判读/取值修正**：
+  - `PHY_STATUS`(0x814) **bit6==0 才是 ready**（`pcie_phy_is_ready`：bit 置位 = NOT ready）——
+    13.3 里"bit6 never set 就没起"的判读是反的；
+  - `PARF_SYS_CTRL`(0x00) 厂商**整写 0x365E**；`PARF_PM_CTRL`(0x20) 清 bit5（K40 DT 无
+    `qcom,no-l1-supported` → l1_supported=true）。
+
+**新增步骤 12–15（已编进内核：2026-10-31 23:40 构建，`mach.development.bcm2837` 15,180,152 B）**：
+
+| 步 | 内容（对齐的厂商函数） |
+|---|---|
+| 12 | 训练寄存器（link_train 前半）：`GEN2_CTRL`(0x80c) [12:8]=1、`GEN3_RELATED`(0x890) bit0 清、preset 0x55555555（经 `MISC`(0x8bc) bit0 门控写入 `SPCIE_CAP`(0x154)）、`DCS`(0x78) max read=5；厂商对 EQ_CONTROL 的怪写落在 RO 的 vendor/device 字上 = 无 op，跳过 |
+| 13 | 放链路（link_train 后半 + enable 末段）：ep_latency 10 ms → PERST 放 → 1 ms → `LTSSM`(0x1b0) bit8 → 20×5 ms 轮询，三条件同时满足：`ELBI_SYS_STTS`(0x08) bit10(XMLH_LINK_UP=0x400) + DBI 0x80 bit29(DLLLA) + DBI 0x00 ≠ 全 F |
+| 14 | 配置窗口（config_controller + cfg_bdf）：iATU region0（**unroll**，每 region 0x200 B、无 viewport）type CFG0、host 0x60100000–0x60100fff、`LTAR`=0x01000000（BDF_OFFSET = bus1 dev0 fn0）；`ACK_F_ASPM`(0x70c) bit15、`AUX_CLK_FREQ`(0xb40)=0x14（19.2 MHz）；轮询 conf 0x00 至 ≠ 全 F，期望 **0x110117cb**（17cb:1101） |
+| 15 | BAR0=0x60300000（MEM 窗口起点）+ COMMAND|=0x6 + MHI 探读：MHIREGLEN/MHIVER/MHICFG/`BHIOFF`(0x28)/BHIEOFF/MHICTRL/MHISTATUS/MHICTRLBASE；BHIOFF 有效再读 BHI 的 VERSION/EXECENV/STATUS/ERRCODE/SERIALNU/MSMHWID |
+
+**真机运行方法**（厂商顺序 = 训练寄存器先于状态机；跳过步骤 11 的 PERST/LTSSM，步骤 13 自己放）：
+`pcie=15 pcie_skip=0x800 pcie_thread=1`。
+
+**中断方案突破（M2/M3 用）**：MSI 是高通私有方案——DT 节点 `qcom,pcie0_msi@17a10040`：
+EP 写 msg 地址 0x17a10040 → GIC SPI **768–799**（0x300–0x31f，32 个），**不需要 ITS/LPI**。
+XNU 侧给 MHI 的"MSI"用 `gic_v3_spi_attach(768+i)` 即可。
+
+**里程碑阶梯**：M1=链路 up + 枚举 17cb:1101 + BAR/MHI 探读（**本轮完成，待真机**）→
+M2=BAR/中断策略 → M3=MHI/BHI 拉起（amss20.bin→M0；BDF→SID 表在 PARF+0x2000、CRC8 hash、
+SMMU 必需；要读厂商 `mhi_boot.c`/`mhi_pm.c` + `cnss2/pci.c`）→ M4=QRTR-over-MHI→QMI
+（`redwood_wlfw.c` 消息可复用）→ M5=ath11k_pci（`tools/mk-ath11k.sh` 需加 pci.c/mhi.c）→ 802.11→en0。
+
+**本轮顺带修复**：daf0e8c（10-31 23:20 的 apfs 容量提交）在 `apfs_vfsops.c` 调用了
+`redwood_ufs_darwin_blocks/free_bytes` 但全树无声明 → 编译失败、内核无法重编。已按该文件 462 行
+`extern void redwood_memory_line` 的既有模式补两条 extern。**注意：23:20 的 apfs 改动此前从未编译过**
+（19:25 的"已验证内核"是该提交之前的产物），本轮 23:40 的内核是它第一次过编译。
+
+### 13.6 panic 修复 + 成品二进制对照 + 系统恢复正常（2026-11-01）
+
+**10-31 23:40 内核真机结果（run234712）**：panic。`kmem_alloc(..., 2097152, 0x100021)` 失败
+（KMA_NOFAIL|PAGEABLE|PERMANENT = io_map 路径），线程启动后 ~20 µs。根因：
+`pcie_steps_thread` 里的冗余 `map_all()`——boot 线程已在 init 映射过 9 个块（~3.6 MB），线程里
+第一次重映射 gcc（2 MB）就挤爆 io 子映射。**修复：删掉线程里的 `map_all()`**（三处同步：Windows
+src/、WSL `~/k40/xnu/files/`、WSL 构建真身 `~/k40/xnu-src/xnu-8796.121.2/bsd/dev/`——注意构建
+只认第三个路径，`files/` 只是 overlay 源；构建 RC=2 与 "exported name not in import list" 噪音
+是既有的，内核照常链接出来）。
+
+**重要勘误（run234712 日志的"WiFi 突破"是残留数据）**：`== END OF LOG ==` 之后的
+pcie 15/16/17 输出、launchd 行（日期 **2026-10-26 08:09**）全部是 logdump/loader 日志缓冲里
+**旧启动的残留**——10-31 内核二进制里没有那些字符串（strings 验证）。别再当作本次成果引用。
+
+**成品二进制（重要资产）**：`C:\Users\MrMoxing\Desktop\ios-alioth\boot\run-payload.bin`
+（2026-10-26 8:09，26,691,360 B）就是跑通 WiFi 的那次成品（**无源码**）。解包（XNUP 格式）后
+kernel 15,750,440 B **带符号表**（`_alioth_pcie_init`/`_run_steps`/ath11k 全套），strings 可反推
+全部做法。它的 cmdline：`pcie=17 pcie_skip=0 pcie_pause=0 pcie_thread=1 pcie_wait=0 pcie_xo=1
+pcie_wlan=1 wifi=1 wifi_pci=1 wifi_lx=2 wifi_station=1 wifi_mac=9c:5a:81:29:98:42 wifi_irq=0
+wifi_quiet=1 gpu=1 fb_flip=2 ...`。成品与当前分步版的关键差异（从字符串区重建）：
+- **PHY：写 DT `qcom,phy-sequence` 全部 (offset,value,0) 三元组**（99 对，alioth.dts L10907）+
+  PCS 软复位 + 逐对读回验证 → `PHY READY (PHYSTATUS %#x, bit 6 clear), PIPE %#x`。当前版不写
+  序列 → PHY 永远 not ready、pipe=0 Hz。
+- **步骤 10 只读 DBI+ELBI**（"no outbound configuration access before iATU setup"）；conf 窗口
+  (0x60100000) 在 iATU 配好前**访问即挂死总线**（本次真机两次证实：conf 挂、改读 dbi 也挂）。
+- 链路先训 **Gen1**（target Gen1、LTSSM bit8、`PCIe LINK UP: Gen%u width x%u`），再 CFG0 iATU
+  （unroll，target bus1 devfn0）→ endpoint 17cb:1101。
+- 还有：**WLAN_EN GPIO20**、RPMh 供电（smpa4/5/6、smpc8，"supply PPID..."）、RCG update 握手
+  （"UPDATE timed out; no controller access attempted"）、BAR0 一致性验证（256 passes/1024 reads）、
+  BHI 走 SMMU stream 0x1c01 slot/bank、MHI/MSI sink 0xa0087000。
+- `parf_sys_ctrl` 成品是 **"bit 29 out"（读改写，只清 bit29）**，不是整写 0x365e——已照改。
+
+**11-01 的两次真机挂死（run151731/run152650）**：第一次 0x60100000(conf) 读挂死，改读 dbi 后
+第二次 0x60000000(dbi) 读挂死——**0x60 区域整体不可达，与读序无关**；成品能读 DBI 的前提是
+PHY 已就绪（写完序列）。⇒ 下一步 = 把 `qcom,phy-sequence` 写进步骤 6（DT 属性解析可参考
+现有驱动从 loader 传下的 device tree 读属性的方式）。
+
+**系统恢复正常（本日最重要）**：`pcie=9`（步骤止于 9，不碰 0x60 区域）真机启动
+**SpringBoard 完整出图**（run153240：主屏/状态栏/电池 98%，截图 219/618/225 KB），pcie 步骤
+1–9 干净跑完、无 panic。panic 修复 + 步骤 5 的 parf_sys_ctrl 修正验证通过。
+当前工作基线：`pcie=9 pcie_thread=1` 系统正常；WiFi 继续按 13.5 里程碑 + 本节成品对照推进。
+
+### 13.7 成品反汇编定案：PHY not ready 的修复（11-01 下午）
+
+**成品内核符号反汇编**（`~/k40/fin/kernel.bin`，`llvm-nm`/`llvm-objdump`；解包脚本
+`tools/unpack-payload.py`；XNUP 格式 = magic+u32 大小，条目 = name[16]+u32 size，数据紧跟）：
+
+- 成品 `_run_steps` 经**函数指针表**（40 个步骤）调度，`_step_phy_seq` @0x…74c8dd4 完整反编译。
+- **99 对序列表逐对完全一致**（`_step_phy_seq.phy_sequence` @0x…7009f50，u16 对）——序列本身
+  不是差异，**差异在序列前后的处理**：
+  1. **PCS 软复位**：写序列前 `phy[0x800] = 1`（"PCS software reset assert"），序列第 97 对
+     {0x800,0x00} 释放。当前版从未 assert ⇒ **这就是 PHYSTATUS bit6 卡 1 的头号根因**。
+  2. **PIPE clock vote 时序**：成品在步骤 3 只 vote 5 位（无 bit4 pipe），序列写完 + dsb + 10ms
+     后才 `gcc 0x52008 |= 0x10`（"pcie0 PIPE clock"，对应厂商 `msm_pcie_pipe_clk_init` 在
+     序列与 ready 等待之间）。当前版步骤 3 一次全 vote 0x3f——已对齐改为 0x2f + 序列后补 bit4。
+  3. ready 轮询 200×1ms（bit6 清 = ready）；**超时不算失败**：dump phy 0x68(PLL clock detect)/
+     0x140(PLL common status)/0x144(PLL reset state)/0x178(PLL common ready)/0x170(PLL sw reset)/
+     0x818/0x81c/0x820(PCS status2/3/4) + gcc 0x52008("PIPE halt after PHY timeout") 后**照样继续**。
+  4. 成品还有（本轮未抄，若仍 not ready 再上）：RPMh 供电投票（SPMI 直写 PMIC arbiter 0x0c440000
+     + SPMI 0x0e600000，smpa6=950/smpa4=1800/smpa5=1900/smpc8=1350，`resource_on`）；boot 开关
+     `pcie_xo`（xo.lvl）/`pcie_wlan`（四路供电）；WLAN_EN GPIO20（0x0f914000 页，IO=2、cfg|0x3c3，
+     等 IO bit1 为高 20ms）；序列逐对读回校验（"PHY sequence mismatch"）；PERST/CLKREQ/WAKE
+     三引脚同页配置（PERST 低、另两个输入上拉 0x7）。
+- **已实施的修复**（alioth_pcie.c，三处路径已同步，内核 15,180,112 B 字符串验证）：
+  ① 步骤 7 序列前 `put(2, "pcs software reset (assert)", 0x800, 1)`；② dsb sy + 10ms 后
+  `0x52008 |= 0x10`；③ 步骤 3 CLOCK_VOTES 只 vote 0x2f；④ ready 轮询 200×1ms + 超时 dump
+  PLL/PCS 寄存器后继续（成品同款）。
+- **本轮验证**：载荷 `pcie=15 pcie_skip=0x800`（成品顺序：跳步骤 11，12/13 含 PERST 释放），
+  备份 `boot/run-payload-pcie9.bin`。验证点：步骤 7 "IS READY"、步骤 10 dbi 读不挂、
+  endpoint 17cb:1101。
+
+**本轮上机记录（11-01 15:35–16:00）**：
+- 第一次 `boot-one.ps1 -SkipFirmware`：adb/bootloader/loader 全过，**`stage system.apfs` 中途
+  USB 断（"Too many links"）**——手机停在 xnuloader。写了 `boot-resume.ps1`（仓库根）：loader
+  已起时跳过前半段，`oem ramdisk` → stage system（重试 3 次）→ stage 载荷 → `oem run` →
+  截图 + 日志；fastboot 路径 `D:\Android\SDK\platform-tools\`。
+- 打包注意：载荷必须**嵌 ramdisk**（`ramdisk=boot/root.apfs`，共 25.6 MB），漏了就没根；
+  PowerShell 调 WSL 时 `$(date +%s)` 会被 PS 吞掉（epoch 写死即可）。
+- 解包脚本定案：`tools/unpack-payload.py`（XNUP = magic+u32 size；条目 = name[16]+u32 size+
+  u32 reserved，数据 16 字节对齐紧跟）。成品内核已解到 `~/k40/fin/kernel.bin`（/tmp 会丢，
+  放家目录）。
+
+### 13.8 Settings→Wi-Fi 面板卡死：已修复；开关与连接 = 无线电路线（11-01 晚）
+
+**现象与根因**：点 Wi-Fi 行后行高亮、面板不出现（run153240.png 实拍）。根因不是 wifid 死锁，
+而是 Settings 与 wifid 共同依赖的三个守护进程不在启动清单——日志 failed lookup 实证：
+`configd`（Settings×4 + wifid×3，SystemConfiguration 本体）、`securityd`（钥匙串）、
+`wifianalyticsd`（wifid 自身助手）。三者都是系统卷里的现成 daemon。
+
+**修复**：三者已加入 `userland/build.sh` 默认 `IOS_JOBS`（commit ea1a5bd）。
+复验（wifipane 轮 + 用户确认）：**面板可以进入了**。
+
+**开关打不开 = 没有无线电**：WiFi 开关需要 radio 在位。两条路线：
+1. **真实无线电（主线）**：`wifi=1`（成品 10-26 的配置）。PCIe PHY 修复（PCS 软复位 + PIPE
+   clock 时序，13.7 节）已在 `alioth_pcie.c` 实现、已编入 15,180,112 B 内核，**pcie=15 验证
+   未跑**（载荷 `boot/run-payload.bin` 已是 pcie=15 pcie_skip=0x800）。跑通后 Settings 应显示
+   Wi-Fi On + 周边网络。
+2. 固件已就位：本机是 QCA6390，已从 `/vendor/firmware_mnt/image/qca6390/` 拉
+   `amss20.bin`(4.35MB) / `m3.bin`(267KB) / `bd_j11gl.elf` / `regdb_j11.bin` → `fw-wifi/qca6390/`。
+   **架构疑点**：发布的 `redwood_wifi.c` 是 wpss（WCN6750 PIL）架构（`qcom,wpss@8a00000`、
+   wpss.mdt/bNN），而本机 image/ 里没有 wpss 只有 qca6390/——10-26 成品（无源码）里两套字符串
+   都有，需对照成品反汇编确定它走的哪条。
+
+**存储**：v2 修复 = `apfs_statfs_refresh()`（apfs_vfsops.c），由 `redwood_ufs` 的 `ufs_ready`
+回调——挂载时 UFS 页未就绪，v1 的挂载期填法无效。但 UFS 路径需要 loader 在 cmdline 附
+`ufs_shared_pa=`（loader.c:3009），**当前 boot.img 的 loader 没有写窗口**，所以真机上 df 仍是
+`/ 2,433,812 KB, 可用 0`（ramfs 1.5 GB 正常）。落地 = flash-root 里程碑（`ufs=2 ufs_native=1`）。
+
+**语言**：`.GlobalPreferences.plist`（zh-Hans-CN/zh-Hans/en + zh_CN + 拼音键盘）经 var/ 种子进入
+`/private/var/mobile/Library/Preferences/`，设备上完好（vol_ls 实证 1698 B，owner 501），
+**但 UI 仍英文**——cfprefsd 为什么不应用，机制未明。下一步：查 iOS 16 是否要求 setup 流程的
+语言标记（`com.apple.mobile.RequiresSetup`?），或改用 `Settings → General → Language & Region`
+触摸自动化一次性设置后由 var_store 持久化。
+
+**壁纸**：iOS 16.5 内置壁纸全部是 PosterBoard 程序化渲染（固件里**没有位图**；传统
+`HomeBackground.cpbitmap` 已生成并播种——用户图 → 1080×2400 BGRA → 12 字节头 cpbitmap，
+Pillow 已装在托管 Python——但 SpringBoard 不读传统路径，黑屏依旧）。正道 = 弄清 PosterBoard
+store 格式或按 `inject_sb.c` 的挂点给 PaperBoardUI 喂真实图片。生成脚本：WorkBuddy 会话目录
+`mk_wallpaper2.py`；产品文件已 gitignore（*.cpbitmap）。
+
+**流程坑（本日新增）**：build.sh 会覆盖 `root/etc/rc.jobs` → 场景用 `RC_JOBS=rc.jobs.wifi`
+在构建时传（相对 userland/，文件须在 WSL userland/ 里）；二进制绝不能过 `tr -d '\r'`（壁纸
+丢 249 字节）；`sound_test` 偶发挂起会让场景后续全停（已从场景头部移除）；mkapfs 大文件存
+decmpfs-4（LZVN），内核只读 zlib-3 → `--plain var` 让种子不压缩。
+
+### 13.9 pcie=7 实测定案：PHY 序列已执行，PLL 不锁 = 缺供电与引脚（11-01 17:4x）
+
+`pcie=7`（只跑 1-7，logdump 尾部恰好是 step 7 全文，`runs/pcie7.log.txt`）：
+
+- 步骤 6：PHY IS NOT READY（status 0x68）——和以前一样。
+- 步骤 7：**修复代码全部执行了**：gcc 两个 PHY BCR 复位+释放、refgen 100 MHz、parf_phy_refclk、
+  `pcs software reset (assert)`（phy_800 回读 = 0，已释放）、PIPE clock 补投（axi_misc=0x410437f）、
+  phy_start_control=0x3、逐对读回。
+- **结果仍是 `the PHY IS NOT READY (status 0x69)`**，且 PLL 诊断全灭：
+  `pll_clock_detect=0`、`pll_common_ready=0`、`pcs_status2=0`。
+- 步骤 8-9 干净跑完（pcie=7 不碰 0x60 区域，系统正常启动，1.3 MB 日志）。
+- **步骤 10 的 DBI 读挂死在 pcie15v2/pcie15slow 两次复现**（字节数停在 58,902）——PHY 不 ready
+  的直接后果，与 13.7 的判断一致。
+
+**定论**：序列与复位都对，PLL 不锁 ⇒ PHY 没电/没参考时钟。下一步 = 把成品里"本轮未抄"的
+部分移植进 `alioth_pcie.c`（在步骤 6 之前）：
+1. **RPMh 供电投票**：SPMI 直写 PMIC arbiter 0x0c440000 + SPMI 0x0e600000，
+   smpa6=950 / smpa4=1800 / smpa5=1900 / smpc8=1350，`resource_on`（SPMI 访问代码可参照
+   redwood_battery.c 的 SPMI 实现）；
+2. **WLAN_EN GPIO20**（0x0f914000 页：IO=2、cfg|0x3c3，等 IO bit1 为高 20 ms）；
+3. **PERST/CLKREQ/WAKE 三引脚配置**（PERST 拉低、另两个输入上拉 0x7）；
+4. `pcie_xo=1`（xo.lvl）与 `pcie_wlan=1`（四路供电）的 boot-arg 等价实现。
+全部有成品反汇编可对照（`~/k40/fin/kernel.bin`，_step_phy_seq 同表的供电/引脚步骤）。
+验证路径：`pcie=7`（看 PLL 是否锁定）→ `pcie=15`（DBI 不挂）→ `pcie=17/ endpoint 17cb:1101`。
+
+### 13.10 UniXNU/FFT-infra 的 alioth 记录：直接命中我们的阻塞点（11-01 晚，用户提供的线索）
+
+来源已存 `docs/reference-unixnu/`：`alioth_pcie.c`（FFT-infra/UniXNU-alioth，723 行，ios-sweet 系列
+在本机验证过）、`2026-10-28-gpu-wifi-bringup.md`（同一台手机 GPU+WiFi 真机读数）、UniXNU 主仓库
+`docs/devices/alioth.md`（设备文档）。
+
+**对我们四个问题的直接帮助**：
+
+1. **WiFi step 10 DBI 挂死的根因假设（他们撞过同一堵墙）**：
+   - step 10 是纯读（`step_dbi()` 全部 get），第一次访问 IATU 窗口（0x60001000）即整机死机，
+     两次尝试一次回 bootloader、一次连 bootloader 都不到（**要断电才能救**——重试有风险）；
+   - 窗口地址与 vendor DTS 逐项一致（不是映射错）；elbi/dbi 重叠无害（step 1 就读过 elbi）；
+   - **真正的嫌疑：时钟投票缺五项**。vendor clock-names 共 11 项，`step_clocks` 只投了
+     0x2f 五项；缺 `pcie_0_ldo`、`pcie_phy_refgen_clk`、`pcie_0_ref_clk_src`、`pcie_tbu_clk`、
+     `pcie_ddrss_sf_tbu_clk`——LDO 与 refgen 决定 core/PHY 供电与参考时钟。
+   - 他们的下一步（未完成）：先补 `pcie_0_ldo` + `pcie_phy_refgen_clk` 两票，只跑到 step 9 确认
+     不挂，再开 step 10。
+   - 我们已移植的 refgen 配置（0x6f014/0x6f018/0x6f02c）与他们的实现一致；`aggre_noc_pcie_tbu`
+     的 CBCR 在 GCC 0x9000c（他们的 step_clocks_dump 已列）。
+2. **PHY ready 极性冲突（同机同值 0x69，两家读法相反）**：我们 `alioth_pcie.c:499` 等 bit6=0
+   （bit6 置位判 NOT READY）；FFT-infra 在同机同寄存器读到 0x69 判 READY（"bit 6 is its ready"，
+   且他们据此走通了 step 9）。上游 qcom-qmp 也是 bit6 置位 = ready。⇒ **我们的极性大概率反了**，
+   即 pcie7 的"NOT READY"其实是 ready。决定性试验：补齐时钟投票后 step 10 若能读回 17cb:1101
+   即证明。改判断前先看这份对照。
+3. **壁纸的机制**：他们试过同一条路——`WALLPAPER stage=5 status=0` 挂载成功但画面不出现，
+   原因是 **PosterBoard 按设备 idiom 选 collection，他们的镜像只有 ~ipad collections**。我们的
+   镜像里有 `~iphone` collections（Clownfish~iphone 等），所以我们的问题在 PosterBoard 进程本身
+   没跑/没选到——这与"给 PaperBoardUI 喂图"是两条不同的路。
+4. **亮度/熄屏**：面板 k11a 背光 = DCS 0x51（bl-max 0x7ff，大端），无 KTZ8866、WLED disabled
+   ——与我们"亮度走 DCS"的结论互证；他们的背光驱动在 `claude/backlight-buttons` 分支未合入。
+5. **SPMI v5 布局**（RPMh 供电投票要用）：`0xc440000/0xc600000/0xe600000/0xe700000/0xc40a000`，
+   32 MiB chnls，每 apid 0x10000；电源键 ppids：PON=0x008、GPIO6=0x0c6。
+6. **存储**：他们走 NativeUfs（ShengUfs fork，真 UFS 驱动）+ RamBlock IOMedia 发布 Data 卷
+   （md0 直接挂 ENOENT panic）；SMMU 流 `native-ufs-stream=0xe0/0x4e0` 复用 bootloader 的 bypass
+   上下文。与我们的 var_store 是两条架构，短期照搬不了，但 SMMU 流数值可参考。
+7. **日志捕获**：他们的 `line()` tee 到 `qcom_usb_debug_write`（QcomXnuUsbDebug 仓库，DWC3 CDC）
+   ——绕开 logdump 4KB 尾部的限制，这正是我们"看不到 step 7 全文"的解法。
+
+**下一步（按此顺序，注意 step 10 有断电风险）**：
+① 把 LDO + refgen 两票补进 step 3（offset 参考：refgen 0x6f02c CBCR、TBU 0x9000c）；
+② `pcie=9` 确认不挂；③ `pcie=10` 读 17cb:1101；④ 修 PHY ready 极性；⑤ 端点枚举后接 MHI/ath11k。
+
+### 13.11 时钟投票补充实验：票加了，DBI 仍挂——GCC 层面已穷尽（11-01 18:4x）
+
+`votes9`（pcie=9 + TBU/refgen 两票）：系统正常启动无回归。实测：TBU 0x9000c **bit0 本来就开着**
+（0x4221）；refgen 0x6f02c 从 0→1 现已全程使能。
+`votes10`（pcie=10 + 两票）：**仍在第一次 DBI 读挂死**（59,535 字节冻结，loader 存活，正常回
+Android——无变砖）。
+
+vendor pci-msm.c 的 pcie_0 时钟表共 **14 项**（MSM_PCIE_MAX_CLK），gcc-kona.c 里**没有**
+`pcie_0_ldo` / `pcie_0_smmu_clk` / `pcie_0_ref_clk_src` / `pcie_0_sleep_clk` / `pcie_tbu_clk` /
+`pcie_ddrss_sf_tbu_clk` 的 branch 结构——ldo 在表里 clk=NULL（vendor 驱动也不使能它，可能是
+RPMh regulator 或常开），其余"时钟"多半也非 GCC branch。
+
+**结论：时钟投票路线在 GCC 层面已穷尽，DBI 挂死另有原因。** 下一步的两个方向：
+1. **对照成品反汇编**（`~/k40/fin/kernel.bin`）的 step 10 与后续（iATU 配置、PARF 写序列、
+   LDO/PARF 处理）——成品在同 loader/UEFI 下读 DBI 成功，差异必在它多做/少做的访问序列里；
+2. **接 QcomXnuUsbDebug**（FFT-infra 的 DWC3 CDC 传输）拿全量内核日志，替代 logdump 4KB 尾部。
+
+### 13.12 远程仓库整理：main 只留真实验证过的（11-01 19:0x，用户决定）
+
+远程 `main` 曾推到 ad89175，其中两个提交失实（`daf0e8c` 存储显示"已修"实际真机未生效、
+`d9d509b` 中文"已播种"实际 UI 未变）且 README 部分表述超前。已 force push 回退并重建：
+
+- **远程 main = `9870135`**：GPU 线 4 提交（af5ab3e/4617034/54268e5/7d1de24）+ 可用工具
+  （ebd954a ubuntu、0d6b1b1 boot-one）+ 诚实版 README（Wi-Fi/存储/语言/壁纸/真熄屏全部
+  标注"未达成"及真实进度）。
+- **本地 `main` = `78685cf`**：完整开发史（含 WiFi/存储/语言/UniXNU 全部 WIP），另有
+  `backup-full-78685cf` 保险分支与 `public` 分支（= 远程内容）。
+- **约定**：某个功能真机验证通过前，其提交不上 `public`/远程；推远程一律从 `public` 线
+  cherry-pick 或 rebase，`main` 保持本地开发史。

@@ -104,6 +104,7 @@ IOS_JOBS=${JOBS-"
 	com.apple.powerd com.apple.analyticsd com.apple.logd_helper
 	com.apple.iconservices.iconservicesagent com.apple.pluginkit.pkd
 	com.apple.SpringBoard com.apple.chronod
+	com.apple.securityd com.apple.configd com.apple.wifianalyticsd
 "}
 # com.apple.chronod is what registers com.apple.chronoservices, and without it the home screen's
 # widgets are laid out as blank shapes: SpringBoard asks for that service every time it draws a
@@ -113,6 +114,14 @@ IOS_JOBS=${JOBS-"
 # extension processes; with it that lookup fails 0 times, seven widget extensions start
 # (CalendarWidget, FitnessWidget, gamecenter.widgets, podcasts.widget...) and Calendar, Weather and
 # Apple News all draw. It also runs the poster/paper machinery the lock screen's wallpaper wants.
+#
+# com.apple.securityd, com.apple.configd, com.apple.wifianalyticsd are what Settings and wifid
+# cannot do without, and what a run without them shows as a frozen pane: pushing Settings's Wi-Fi
+# pane left the row highlighted and the application stuck (run153240, 2026-11-01), and the log says
+# what both were asking for and never got -- configd four times from Settings and three from wifid,
+# securityd from wifid, wifianalyticsd twice from wifid. configd is SystemConfiguration itself (the
+# network panes live in it), securityd is the keychain the saved networks go to, wifianalyticsd is
+# wifid's own helper. All three are stock daemons of the image, started for nothing but themselves.
 # iOS's own Wi-Fi daemon, for Settings to have a Wi-Fi to show: the kernel answers it in
 # bsd/dev/redwood_apple80211.c. With the radio (wifi=1) Settings then shows Wi-Fi on, the network joined and the
 # networks the radio hears. NOT FINISHED: a network cannot be joined from Settings yet.

@@ -37,7 +37,7 @@ fastboot boot → Mu-Silicium UEFI → xnuloader (EFI 应用) → XNU → launch
 | EPSS 三簇调频 1804 / 2419 / 3187 MHz | `docs/evidence/2026-10-22-first-boot-kernel.log` |
 | 数据卷跨启动持久化（`var_store`，2×2 GiB） | `com.redwood.varstore` job；`kern.redwood.ufs_write_bytes` |
 
-**仍未达成（勿期待）**：Wi-Fi（QCA6390，见 §6 表）、真实音频（`mediaserverd` 未启动）、相机、蜂窝/蓝牙；
+**仍未达成（勿期待）**：Wi-Fi 开关与连接（面板已可打开，见 §6 表）、真实音频（`mediaserverd` 未启动）、相机、蜂窝/蓝牙；
 **真熄屏**（电源键目前是画黑帧，面板仍通电——AMOLED 需 DSI 命令，见 §6）；系统默认壁纸
 （iOS 16 的壁纸由 PosterBoard 程序化渲染，见 §6）；存储显示（仍报 2 GB / 0，见 §6）；系统语言（默认仍英文，
 中文种子在开发分支尚未生效）；7 个核里只有 4 个 online。
@@ -391,7 +391,7 @@ GitHub 仓库不含 `firmware/` 与 `boot/system.apfs`（见 §3.1 / §7），�
 | 真熄屏 | **假息屏**：电源键后画黑帧，面板仍通电（AMOLED 无背光，亮度走 DCS；K40 面板 k11a 的 WLED 驱动未绑定可证）。XNU 无 DSI 驱动，面板由 UEFI DisplayDxe（闭源 .efi）初始化 | 需在 XNU 实现 MDSS DSI 命令模式 + DCS 0x28/0x10，是多会话工程 |
 | 默认壁纸 | iOS 16.5 的壁纸是 PosterBoard 程序化渲染，镜像与固件里**没有位图**；壁纸进程从未运行过，材质回落洋红 | 让 PosterBoard 跑起来并产出 wallpaper store；或注入层给 PaperBoardUI 喂真实图片（`inject_sb.c` 已有挂点说明） |
 | 存储 | About 报 "2 GB / 0 可用"：只读系统卷把可用空间报成 0。**未修复**——修复代码（按 darwin 容器 20 GiB 上报）在开发分支，且需 loader 在命令行附带 `ufs_shared_pa`（写窗口）才会在真机生效 | 数据卷本身仍是 RAM（ramfs，上限约为内存 1/4）；持久化走 `var_store`（2×2 GiB darwin 分区） |
-| Wi-Fi（QCA6390 PCIe0） | **未通**。实测（2026-11-01，pcie=7）：PHY 时钟/复位/PIPE 序列全部执行，但 step 10 首次读 DBI 即挂死（两次复现）；补 TBU/refgen 时钟票后仍挂——GCC 时钟层面已穷尽（LDO/ref_clk_src 不是 GCC 寄存器） | 对照 10-26 成品内核反汇编其 step 10 / iATU / PARF 访问序列找差异；或接 USB CDC 全量日志替代 logdump 4 KB 尾部 |
+| Wi-Fi（QCA6390 PCIe0） | **面板已可打开**（2026-11-01 真机验证：补 configd/securityd/wifianalyticsd 三个守护进程，前为卡死实拍 `docs/evidence/2026-11-01-wifi-pane-frozen.png`）；**开关与连接未通**：pcie=7 实测 PHY 序列全部执行，但 step 10 首次读 DBI 即挂死（两次复现）；补 TBU/refgen 时钟票后仍挂——GCC 时钟层面已穷尽 | 对照 10-26 成品内核反汇编其 step 10 / iATU / PARF 访问序列找差异；或接 USB CDC 全量日志替代 logdump 4 KB 尾部。开发中间态在 `wip/wifi-storage-language` 分支 |
 | 音频 | `mediaserverd` 未启动，音量条电平由 userland 维持 | — |
 | CPU | 只有 4 核 online（A55 未起） | — |
 

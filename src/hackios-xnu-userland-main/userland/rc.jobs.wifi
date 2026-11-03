@@ -1,0 +1,6 @@
+# Commands run by the launchd job com.redwood.demo (see com.redwood.demo.plist).
+# Timed so that the console diagnostics (df, vol_ls) land before the log is fetched at T+110 s:
+# unlock, Settings, the Wi-Fi row (y=0.46), home, then df and the seeded preferences.
+/redwood/bin/rwtouch wait 25 swipe 0.5 0.985 0.5 0.3 200 wait 6 tap 0.615 0.72 wait 15 tap 0.5 0.46 wait 25 button home wait 5
+/bin/df -k
+/redwood/bin/vol_ls ls /private/var/mobile/Library/Preferences
