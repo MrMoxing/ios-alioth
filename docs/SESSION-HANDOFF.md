@@ -1303,3 +1303,76 @@ init 解包回来。真机连跑六轮，generation 1→4 在槽 0/槽 1 之间�
 
 **下一步**：语言/壁纸/watchdog 之后可以真正"改了就不回退"——中文语言实验、壁纸选择、Wi-Fi
 密码都能跨重启保留，这几个目标的验证路径因此才通。
+
+### 13.16 系统语言：偏好确实进到了 SpringBoard，问题在 bundle 认定（11-03 16:2x–16:4x，真机取证）
+
+**一句话**：三处 `.GlobalPreferences.plist` 都写着 `zh-Hans-CN`，这轮又直接从 **SpringBoard 进程内部**
+问了一遍 CoreFoundation——`AppleLanguages` 三种视图全部返回 `[zh-Hans-CN, zh-Hans, en]`。
+所以"域不对""cfprefsd 起晚了"这两个假设都死了；剩下的只有一件事：**SpringBoard 是否被判定为
+"有中文"**。这一步的答案被自己写崩了 SpringBoard，还没来得及拿到。
+
+**先排掉"资源不存在"**（离线，`tools/loctable-langs.py`、`tools/loctable-keys.py`）：
+
+| 事实 | 数字 |
+|---|---|
+| `SpringBoard.app/SpringBoard.loctable` | 1,117,760 B，bplist，**42 个顶层键** |
+| 其中的语言 | `zh_CN` / `zh_TW` / `zh_HK` / `en` / `en_GB` … 共 24 个正式语言 |
+| 中文条目 | 与英文**同键 438 个**，全是真中文：`LOW_BATT_TITLE` = `电池电量不足`、`DISPLAY_BRIGHTNESS` = `显示屏` |
+| 磁盘上的 `.lproj` | 只有 `en.lproj`、`en_GB.lproj`——`Preferences.app` 也一样（另有 `Localizable.loctable`、`InfoPlist.loctable`） |
+
+最后一行很重要：**真机上 iOS 16 的 app 也只带 en 的 `.lproj`**，语言清单只能来自 loctable。
+所以"缺 `zh-Hans.lproj`"不能当成原因，也说明修法不能是"补一个空 lproj"。
+
+**进程内取证**（`src/inject_sb.c` 新增 `language_state()`，boot-arg `lang_probe=1` 或通知
+`com.redwood.lang` 触发；`runs/lang2.log.txt` + `runs/logdump-last.bin`，真机 16:32:46 开机）：
+
+```
+$ /redwood/bin/rwtouch notify com.redwood.lang
+rwtouch: notification com.redwood.lang: posted
+redwood: ln: asked, uid 501
+redwood:   AppleLanguages (any application, this user) = [zh-Hans-CN, zh-Hans, en] (3)
+redwood:   AppleLanguages (any user, any host)          = [zh-Hans-CN, zh-Hans, en] (3)
+redwood:   AppleLanguages (any user, this host)         = [zh-Hans-CN, zh-Hans, en] (3)
+```
+
+`uid 501` 就是 mobile——SpringBoard 自己的身份。三行同时成立的意思是：**不是 cfprefsd 的问题，
+不是域的问题，也不是时序的问题**；`AppleLocale` 能让锁屏日期变中文、`AppleLanguages` 能读到，
+都是同一个文件同一份数据。
+
+**然后 SpringBoard 崩了，是探针的错**（16:33:09）：
+
+```
+SpringBoard[8:209] -[NSTaggedPointerString count]: unrecognized selector sent to instance 0xb6…
+SpringBoard[8:209] *** Terminating app due to uncaught exception 'NSInvalidArgumentException'
+```
+
+原因是下一行要打印 `AppleLocale`（一个 **string**），而被送进了按数组打印的函数：
+`CFArrayGetCount()` 对 CFString 就是发 `count` 消息。已修（`say_cfarray` 先看 `CFGetTypeID`，
+不是数组就按字符串打印）。**这就是"离线看不出、上机才炸"的典型**，也说明探针本身要当被测代码对待。
+
+**还没拿到的**：修好后重建的 `lang3` 载荷在刷 system.apfs 阶段被中断，`runs/lang3.*` 不存在，
+下面两个问题仍无答案——下一轮一开机就有：
+
+1. `CFBundleCopyLocalizationsForPreferences(SpringBoard.loctable 的 42 种语言, NULL)` 选的是
+   `zh_CN` 还是 `en`？——前者说明 bundle 认定没问题，英文串另有来源；后者说明认定这一步就断了。
+2. `CFBundleCopyLocalizedString(board, "LOW_BATT_TITLE", …)` 返回 `电池电量不足` 还是 `<no such key>`？
+   ——这一条同时验证**这张 loctable 读不读得动**。它是 decmpfs **type 4**，和加载失败的
+   `PingFang.ttc` 同一类：若读不动，语言和字体就是同一个根因（内核的 decmpfs-4 读路径），
+   而不是两个独立问题。
+
+**这轮加的工具**（都已提交到 `main`）：
+- `tools/loctable-langs.py`：一张 loctable 有哪些语言（键就是语言）。
+- `tools/loctable-keys.py`：两种语言逐键对照，用来确认"中文串真的在里面"。
+- `ubuntu/build-scene2.sh` 现在把整个 `src/` 同步进构建树（之前只同步 `var_store.c`，
+  注入库的改动会被旧副本吃掉），并支持 `EXTRA_ARGS`。
+
+**一个必须记住的坑**：Git Bash 里 `EXTRA_ARGS=… wsl bash …` **传不进去**，WSL 只透传 `WSLENV`
+列出的变量——第一轮 `lang2` 就是这样跑成了没有 `lang_probe=1` 的命令行，白跑一轮。正确写法：
+`WSLENV=EXTRA_ARGS EXTRA_ARGS="lang_probe=1" wsl bash ubuntu/build-scene2.sh rc.jobs.lang lang3`。
+
+**旁证**：这一轮 SpringBoard 崩过一次，持久化照旧完成（`ufs: 9 writes into darwin, 25,530,368 bytes,
+read back the same; 0 refused`，返回前 1.5 s 保存完），说明存档不依赖 UI 存活。
+
+**中断时的现场**：`lang3` 上机跑到"刷 system.apfs"这一步被打断，手机**现在停在 loader 里**
+（`fastboot devices` 显示 `xnuloader`），没有写任何分区。下一轮可以直接接着 stage + run；
+想先回 Android 就 `fastboot reboot`。
