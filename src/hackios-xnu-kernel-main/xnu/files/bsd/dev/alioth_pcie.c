@@ -38,6 +38,14 @@
  *   9-10  read the whole clock corner, then the wrapper's registers
  *   11 brings  the link up in the vendor's order: PERST out, the training registers in, the state machine
  *              on, and the vendor's three checks polled together
+ *   12-13 the endpoint: its config space (vendor/device, the BAR probed and assigned), the root
+ *              complex's iatu region 0 pointed at it 1:1, and the MHI/BHI registers behind the BAR
+ *   14 the  firmware: amss20.bin (the phone's own, from fw-gpu/ into the image's fw/) downloaded
+ *              through BHI -- address, size, trigger, and the status machine waited for
+ *   15-17 the MHI proper (mhi_pm.c's mhi_ready_state_transition, mhi_init.c's mhi_init_mmio): the
+ *              firmware's boot watched to the AMSS execution environment and the READY bit, one piece
+ *              of physical memory for the context arrays and the rings, the MMIO base registers
+ *              programmed, the event rings' doorbells rung, and the move to M0 polled for
  *
  * Nothing touches the core's own windows (0x60000000) before step 11 has the endpoint out of reset: a
  * DBI access with PERST held took the machine down twice -- 2026-11-03 here, 2026-10-30 in the UniXNU
@@ -98,7 +106,7 @@ pause_group(void)
 	}
 }
 
-#define BLOCK_NAMES 8
+#define BLOCK_NAMES 9
 static struct {
 	const char *name;
 	uint64_t base;
@@ -121,6 +129,14 @@ static struct {
 	 * WLAN_EN gpio 20 at 0x0f914000 and PERST gpio 79 at 0x0f94f000.
 	 */
 	{ "tlmm-north", 0x0f900000, 0x90000 },
+	/*
+	 * The endpoint's BAR0 window: the iatu covers the whole MB the BAR decodes, but only the first
+	 * 64 KB are mapped here -- the MHI registers (4 KB), the BHI block behind BHIOFF and the device's
+	 * BHI_EXECENV at 0xe228 all live inside them. The io_submap is eight MB and the other eight blocks
+	 * take 3.6 MB of it: mapping the full MB here panicked with "kmem_alloc(1048576) failed" before a
+	 * single step ran (p26, 2026-11-04).
+	 */
+	{ "mhi", 0x60300000, 0x10000 },
 };
 
 static uint64_t
@@ -1036,6 +1052,578 @@ step_ltssm(void)
 	return false;
 }
 
+/* ---- the endpoint beyond the link: its config space, its BAR, its MHI ---------------------- */
+
+/*
+ * The endpoint's configuration space is reached the way the vendor reaches it (pci-msm.c's
+ * msm_pcie_oper_conf and msm_pcie_cfg_bdf): the conf window (0x60100000) is not an ECAM -- it only
+ * answers once the root complex's iatu region 0 has been pointed at the device's BDF as a type 0
+ * configuration region. The iatu sits in its own window here (0x60001000, the dt's "iatu"; region n
+ * starts at n * 0x200 and there is no viewport register), region 0 is kept for configuration, and the
+ * type is 0x04 (CFG0) for the secondary bus, the target carrying bus in bits 31:24 and devfn in
+ * 23:16. Memory needs no iatu at all: the AXI "memory" window (0x60300000, the dt's 0x3d00000) is
+ * identity-mapped onto the bus, so the BAR is assigned an address inside it and the TLPs carry the
+ * same one. The first version here programmed region 0 as memory through the standard DWC offsets
+ * -- wrong table, wrong idea, and every read of the endpoint answered all ones (p27, 2026-11-04).
+ *
+ * The MHI and BHI registers are the standard MHI 1.0 map (mhi_internal.h): MHIREGLEN 0x0, MHICFG
+ * 0x10, CHDBOFF 0x18, ERDBOFF 0x20, BHIOFF 0x28, MHICTRL 0x38 (ready is MHISTATUS 0x48 bit 0), and
+ * the BHI block at BHIOFF -- EXECENV 0x28, STATUS 0x2C (its state machine in bits 31:30, SUCCESS 2),
+ * the image address and size at 0x08/0x10, the trigger at 0x18. The cnss2 driver also reaches the
+ * device's BHI_EXECENV at the device-internal 0x01e0e228, which sits inside what BAR0 maps (the
+ * device's own 0x01e00000 region): both are read here, side by side.
+ */
+#define EP_CFG_VENDOR_DEVICE    0x00
+#define EP_CFG_COMMAND          0x04
+#define EP_CFG_BAR0             0x10
+#define EP_CFG_CMD_MEM_EN       (1u << 1)
+#define EP_CFG_CMD_BUS_MASTER   (1u << 2)
+
+/* the iatu's own window (dt "iatu", block 4): region 0, the one kept for configuration */
+#define IATU_CTRL1              0x000
+#define IATU_CTRL2              0x004
+#define IATU_LOWER_BASE         0x008
+#define IATU_UPPER_BASE         0x00c
+#define IATU_LIMIT              0x010
+#define IATU_LOWER_TARGET       0x014
+#define IATU_UPPER_TARGET       0x018
+#define IATU_TYPE_CFG0          0x04u   /* a type 0 configuration TLP: the secondary bus */
+#define IATU_REGION_ENABLE      (1u << 31)
+
+#define EP_BDF                  0x01000000ul    /* bus 1, device 0, function 0, as the iatu wants it */
+#define MHI_WINDOW_BASE         0x60300000ul
+#define MHI_WINDOW_SIZE         0x100000ul      /* what the BAR window decodes (the dt's "memory") */
+#define MHI_MAP_SIZE            0x10000ul       /* what is actually mapped: the first 64 KB */
+
+static bool
+step_ep_cfg(void)
+{
+	uint32_t bar0, probe;
+
+	announce("the endpoint's configuration space: the iatu's region 0 pointed at its BDF as a "
+	    "configuration region, who it is, how big its first BAR is, an address assigned to it");
+	/* region 0: from the conf window to the endpoint's type 0 configuration space */
+	put(4, "iatu ctrl2 (off before changing)", IATU_CTRL2, 0);
+	put(4, "iatu ctrl1 (cfg0)", IATU_CTRL1, IATU_TYPE_CFG0);
+	put(4, "iatu lower base (the conf window)", IATU_LOWER_BASE, 0x60100000);
+	put(4, "iatu upper base", IATU_UPPER_BASE, 0);
+	put(4, "iatu limit (4 KB)", IATU_LIMIT, 0x60100000 + 0x1000 - 1);
+	put(4, "iatu lower target (bus 1, device 0, function 0)", IATU_LOWER_TARGET, EP_BDF);
+	put(4, "iatu upper target", IATU_UPPER_TARGET, 0);
+	put(4, "iatu ctrl2 (enable)", IATU_CTRL2, IATU_REGION_ENABLE);
+	get(4, "iatu ctrl2 read back", IATU_CTRL2);
+	pause_group();
+	get(5, "ep vendor:device", EP_CFG_VENDOR_DEVICE);
+	get(5, "ep command/status", EP_CFG_COMMAND);
+	bar0 = get(5, "ep bar0 before", EP_CFG_BAR0);
+	wr(reg(5, EP_CFG_BAR0), 0xffffffffu);
+	probe = get(5, "ep bar0 probed (the ones written)", EP_CFG_BAR0);
+	wr(reg(5, EP_CFG_BAR0), bar0);
+	line("the bar restored to %#x; the probe read %#x", bar0, probe);
+	pause_group();
+	{
+		uint32_t size = (~(probe & ~0xfu)) + 1;
+		bool bar64 = (probe & 0x6u) == 0x4u;    /* bits 2:1: 10 is a 64-bit BAR, 00 a 32-bit one */
+
+		line("the MHI BAR is %#x bytes at the low bits %#x%s", size, probe & 0xf,
+		    bar64 ? " (64-bit)" : "");
+		if (size < 0x100u || size > MHI_WINDOW_SIZE || (probe & 0xf & ~0x4u) != 0) {
+			say("the BAR does not look like plain memory; not assigning it\n");
+			return false;
+		}
+		put(5, "ep bar0 (assigned)", EP_CFG_BAR0, MHI_WINDOW_BASE);
+		if (bar64) {
+			put(5, "ep bar0 upper (zero)", EP_CFG_BAR0 + 4, 0);
+		}
+	}
+	put(5, "ep command (mem space, bus master)", EP_CFG_COMMAND,
+	    (get(5, "ep command", EP_CFG_COMMAND) | EP_CFG_CMD_MEM_EN | EP_CFG_CMD_BUS_MASTER));
+	/*
+	 * The root port's own command word sits in its dbi (0x60000000, block 6): the same two bits, so
+	 * its windows answer memory TLPs.
+	 */
+	put(6, "rc command (mem space, bus master)", EP_CFG_COMMAND,
+	    (get(6, "rc command", EP_CFG_COMMAND) | EP_CFG_CMD_MEM_EN | EP_CFG_CMD_BUS_MASTER));
+	line("both command words carry memory space and bus master now");
+	/*
+	 * The root port's bridge windows (type 1, dbi 0x1c-0x2c) filter the TLPs that travel upstream --
+	 * and the firmware download in step 14 is the first upstream traffic there is: the device reads
+	 * its image out of our RAM with a DMA of its own, and an address outside the memory window is
+	 * answered with an unsupported request (the PBL of p33 hung on it, its error register pointing at
+	 * its own 0x426890). The kernel and the images live at 0xf7000000-0xfdffffff; the window covers
+	 * that (the PCIe windows themselves sit at 0x60000000-0x64ffffff, well below).
+	 */
+	get(6, "rc memory base/limit before", 0x20);
+	get(6, "rc prefetch base/limit before", 0x24);
+	put(6, "rc memory base/limit (0xf0000000-0xfdffffff)", 0x20, (0xfdfu << 20) | (0xf00u << 4));
+	get(6, "rc memory base/limit read back", 0x20);
+	line("the bridge's memory window covers our RAM now");
+	pause_group();
+	line("the first read of the MHI registers (the BAR's own memory) comes now");
+	get(8, "mhi reglen", 0x0);
+	line("the MHI registers answer: the read did not hang");
+	get(8, "mhi version", 0x8);
+	get(8, "mhi status", 0x48);
+	return true;
+}
+
+static bool
+step_mhi_look(void)
+{
+	uint32_t bhioff, execenv;
+
+	announce("the MHI's own registers and, behind BHIOFF, the BHI block the boot comes through");
+	get(8, "mhi cfg (channels)", 0x10);
+	get(8, "mhi chdb off", 0x18);
+	get(8, "mhi erdb off", 0x20);
+	bhioff = get(8, "mhi bhi off", 0x28);
+	get(8, "mhi bhie off", 0x2c);
+	get(8, "mhi ctrl", 0x38);
+	get(8, "mhi ctrl base lower", 0x80);
+	get(8, "mhi status", 0x48);
+	pause_group();
+	if (bhioff == 0 || bhioff >= MHI_MAP_SIZE) {
+		say("the BHI offset does not look right (%#x); going no further here\n", bhioff);
+		return false;
+	}
+	get(8, "bhi version minor", bhioff + 0x00);
+	get(8, "bhi version major", bhioff + 0x04);
+	get(8, "bhi imgaddr low", bhioff + 0x08);
+	get(8, "bhi imgaddr high", bhioff + 0x0c);
+	get(8, "bhi imgsize", bhioff + 0x10);
+	get(8, "bhi txdb", bhioff + 0x18);
+	get(8, "bhi intvec", bhioff + 0x20);
+	execenv = get(8, "bhi execenv", bhioff + 0x28);
+	get(8, "bhi status", bhioff + 0x2c);
+	get(8, "bhi serial", bhioff + 0x40);
+	/* the same word the cnss2 driver reaches at the device's own 0x01e0e228 */
+	get(8, "bhi execenv (the device's own 0x01e0e228)", 0xe228);
+	line("the boot environment (EE) is %u: 0 PBL, 1 SBL, 2 AMSS, 3 RDDM", execenv);
+	return true;
+}
+
+/* ---- step 14: the SBL, through BHI ----------------------------------------------------------- */
+
+/*
+ * The PBL that the endpoint came out of reset with (EE 0) knows one trick: BHI. The host points
+ * BHI_IMGADDR at a piece of contiguous memory holding an image, writes its size to BHI_IMGSIZE, and
+ * rings BHI_IMGTXDB; the device fetches it with a DMA of its own and runs it.
+ *
+ * What goes in first is NOT the 4.3 MB AMSS. It is the **SBL**, the 512 KiB stub that the AMSS image
+ * starts with: the PBL hands control to it and the SBL is what later fetches the rest through BHIE.
+ * This is the split qwx makes in if_qwx_pci.c (SBL by BHI, then AMSS in 512 KiB vectors through BHIE)
+ * and the one Klipboard2022/k40-ios-experiments got a working Wi-Fi with on this same phone
+ * (overlays/hakios/.../hakios.pcie.c, step 30: "requested signed SBL transfer (512 KiB) through
+ * BHI"). p36 offered the whole 4,352,144 bytes to the PBL instead: BHI_STATUS stayed 0 for 200 ms
+ * and then every BAR0 register read all ones -- the endpoint had gone, which is what a PBL given an
+ * image it cannot take does.
+ *
+ * The image is the phone's own /vendor/firmware_mnt/image/qca6390/amss20.bin, which
+ * userland/build.sh puts into the image's fw/ directory; redwood_image_file() finds it in the
+ * memory of the RAM disk. A successful transfer leaves BHI_STATUS's top two bits at 2 and moves
+ * BHI_EXECENV off 0 (1 = SBL); the error registers say more when it does not.
+ */
+extern const uint8_t *redwood_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
+extern uint64_t kvtophys(vm_offset_t va);       /* (pmap.h) the physical address of a kernel pointer */
+
+#define SBL_BYTES       0x80000u        /* 512 KiB: what the PBL's BHI takes, and what qwx sends */
+
+static bool
+step_bhi_amss(void)
+{
+	const uint8_t *amss;
+	uint64_t size = 0, phys = 0, image_phys, expected;
+	uint32_t bhioff, status = 0, waited, attempt, ee;
+	int disk = -1;
+
+	announce("the SBL through BHI: amss20.bin found in the image, its first 512 KiB checked as one "
+	    "piece of physical memory, the address and size written, the trigger rung, the status waited for");
+	amss = redwood_image_file("fw", "amss20.bin", &size, &disk);
+	if (amss == NULL || size == 0) {
+		say("no amss20.bin in the image: put the phone's /vendor/firmware_mnt/image/qca6390/amss20.bin "
+		    "into fw-gpu/ and rebuild the userland\n");
+		return false;
+	}
+	line("amss20.bin: %llu bytes in the image of /dev/md%d at %#llx", size, disk, (uint64_t)(uintptr_t)amss);
+	if (size < SBL_BYTES || memcmp(amss, "\177ELF", 4) != 0) {
+		say("the image is %llu bytes and does not begin with an ELF header; the SBL is its first "
+		    "512 KiB and this is not it\n", size);
+		return false;
+	}
+	image_phys = kvtophys((vm_offset_t)amss);
+	expected = image_phys;
+	for (uint64_t page = 0; page < size; page += 0x1000) {
+		uint64_t here = kvtophys((vm_offset_t)amss + page);
+
+		if (here != expected) {
+			say("the image is not one piece of physical memory (page %llu at %#llx, wanted %#llx); "
+			    "BHI takes a contiguous region\n", page / 0x1000, here, expected);
+			return false;
+		}
+		expected = here + 0x1000;
+	}
+	line("the image is one piece of physical memory at %#llx", image_phys);
+	/*
+	 * The image is not what the device is pointed at: a buffer of our own is, the way the reference
+	 * does it (kmem_alloc_contig, then the image copied in). Two reasons -- the address is then one
+	 * we chose and can report, and it is allocated where the kernel sees fit rather than wherever
+	 * the RAM disk happened to land, which is the variable p37 could not separate from the rest.
+	 */
+	{
+		vm_offset_t sbl = 0;
+		kern_return_t kr = kmem_alloc_contig(kernel_map, &sbl, SBL_BYTES, 0, 0, 0,
+		    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT);
+
+		if (kr != KERN_SUCCESS) {
+			say("no contiguous %u bytes for the SBL\n", SBL_BYTES);
+			return false;
+		}
+		memcpy((void *)sbl, amss, SBL_BYTES);
+		phys = kvtophys(sbl);
+		line("the SBL is copied into %u bytes of contiguous memory at physical %#llx",
+		    SBL_BYTES, phys);
+	}
+	bhioff = get(8, "mhi bhi off", 0x28);
+	ee = get(8, "bhi execenv before", bhioff + 0x28);
+	if (bhioff != 0x100u) {
+		say("the BHI block is at %#x, not the 0x100 every write below assumes; going no further\n", bhioff);
+		return false;
+	}
+	if (ee != 0) {
+		say("the execution environment is %u, not 0 (PBL): the endpoint has already been booted once "
+		    "in this run, and BHI only answers a PBL\n", ee);
+		return false;
+	}
+	/*
+	 * Polled BHI, no MSI: the transfer's progress is read out of BHI_STATUS, so nothing has to be
+	 * routed, acknowledged or left pending when the wait below ends.
+	 */
+	put(8, "bhi polled (no MSI)", bhioff + 0x20, 0);
+	/*
+	 * The DMA the download is done with is the first traffic that travels upstream, from the device
+	 * into our RAM. The bridge window (step 12) lets it through the root port; what sits behind that
+	 * is the applications SMMU (dt: apps-smmu@15000000, the endpoint's stream 0x1c00) -- but its
+	 * registers are the hypervisor's to answer for, and the one probe this driver made of CR0 hung
+	 * the calling thread without an answer (p35, 2026-11-04). The UFS, whose DMA has worked since
+	 * the first boot without anybody programming the SMMU for it, says the streams go through; so
+	 * the SMMU is left alone here. The reference implementation does programme it and hands the
+	 * device an IOVA instead (qca_dma_prepare, SID 0x1c01) -- if the address is what fails next,
+	 * that is the piece to port, not this one.
+	 */
+	sleep_ms(2000);         /* the PBL has only just seen the link: a moment before asking it for DMA */
+	for (attempt = 1; attempt <= 1; attempt++) {       /* one trigger: a wedged endpoint is not retried */
+		put(8, "bhi status (cleared first, as the vendor does)", bhioff + 0x2c, 0);
+		put(8, "bhi imgaddr low", bhioff + 0x08, (uint32_t)phys);
+		put(8, "bhi imgaddr high", bhioff + 0x0c, (uint32_t)(phys >> 32));
+		put(8, "bhi imgsize (the SBL)", bhioff + 0x10, SBL_BYTES);
+		/* what the endpoint kept of that: a write that does not stick makes the trigger meaningless,
+		 * and p37 could not tell the two apart after the fact */
+		get(8, "bhi imgaddr low read back", bhioff + 0x08);
+		get(8, "bhi imgaddr high read back", bhioff + 0x0c);
+		get(8, "bhi imgsize read back", bhioff + 0x10);
+		pause_group();
+		put(8, "bhi imgtxdb (the trigger)", bhioff + 0x18, attempt);
+		status = 0;
+		for (waited = 0; waited < 300; waited++) {      /* up to half a minute an attempt */
+			status = rd(reg(8, bhioff + 0x2c));
+			ee = rd(reg(8, bhioff + 0x28));
+			if ((status >> 30) == 2 || (status >> 30) == 3 || ee != 0) {
+				break;
+			}
+			if ((waited % 10) == 0) {
+				/* a line a second: the loader only mirrors the log for its first 24 s, so the
+				 * download is best watched inside that window (pcie_pause=100 pulls the steps early) */
+				line("BHI still going after %u ms (status %#x, execenv %u)", waited * 100, status, ee);
+			}
+			sleep_ms(100);
+		}
+		line("BHI status %#x after %u ms (attempt %u): the top two bits %u (%s), execenv %u", status,
+		    waited * 100, attempt, status >> 30,
+		    (status >> 30) == 2 ? "SUCCESS" : (status >> 30) == 3 ? "ERROR" : "still going", ee);
+		if ((status >> 30) == 2 || ee != 0) {
+			break;
+		}
+		if (status == 0xffffffffu) {
+			line("the BHI registers read all ones: the device or the link went away");
+			get(1, "parf ltssm after the failure", 0x1b0);
+			get(3, "elbi sys status after the failure", 0x08);
+			/* the config space answers even when the BAR does not: a device that only reset its
+			 * function still has its vendor id, one that left the bus has not */
+			get(5, "ep vendor:device after the failure", 0);
+			get(8, "mhi ctrl after the failure", 0x38);
+			get(8, "mhi status after the failure", 0x48);
+		} else {
+			get(8, "bhi errcode", bhioff + 0x30);
+			get(8, "bhi errdbg1", bhioff + 0x34);
+			get(8, "bhi errdbg2", bhioff + 0x38);
+			get(8, "bhi errdbg3", bhioff + 0x3c);
+		}
+		sleep_ms(2000);         /* a device that reset itself needs a moment before the next attempt */
+	}
+	line("the SBL is in: execution environment %u (1 = SBL, 2 = AMSS), %llu of the image's %llu bytes "
+	    "sent", ee, (uint64_t)SBL_BYTES, size);
+	get(8, "mhi status after the SBL", 0x48);
+	return ee != 0 || (status >> 30) == 2;
+}
+
+/* ---- steps 15-17: the MHI proper ------------------------------------------------------------- */
+
+/*
+ * The register map the firmware speaks from here on (BAR0 offsets, mhi_internal.h): MHICFG 0x10
+ * (the device's counts: channels in bits 7:0, event rings in 23:16), the doorbell array offsets
+ * CHDBOFF 0x18 and ERDBOFF 0x20, MHICTRL 0x38 (bit 1 RESET, the state requested in bits 15:8),
+ * MHISTATUS 0x48 (bit 0 READY, bits 15:8 the current state), the context base pointers CCABAP
+ * 0x58, ECABAP 0x60, CRCBAP 0x68, the command ring doorbell CRDB 0x70, and the four window words
+ * MHICTRLBASE/LIMIT 0x80-0x8f and MHIDATABASE/LIMIT 0x98-0xa7 that bound the host memory the
+ * device may touch. A context element is 44 bytes: three words, then the four unaligned qwords
+ * rbase, rlen, rp, wp (struct mhi_chan_ctxt/mhi_event_ctxt/mhi_cmd_ctxt, all __packed). A ring
+ * element (struct mhi_tre) is 16 bytes.
+ */
+#define MHI_MHICFG      0x10
+#define MHI_CHDBOFF     0x18
+#define MHI_ERDBOFF     0x20
+#define MHI_BHIOFF      0x28
+#define MHI_MHICTRL     0x38
+#define MHI_MHISTATUS   0x48
+#define MHI_CCABAP      0x58
+#define MHI_ECABAP      0x60
+#define MHI_CRCBAP      0x68
+#define MHI_CTRLBASE    0x80
+#define MHI_CTRLLIMIT   0x88
+#define MHI_DATABASE    0x98
+#define MHI_DATALIMIT   0xa4
+
+#define MHI_CTRL_RESET          (1u << 1)
+#define MHI_STATUS_READY        (1u << 0)
+#define MHI_STATUS_SYSERR       (1u << 2)
+#define MHI_STATE_M0            2               /* MHICTRL's state field, and MHISTATUS's answer */
+#define MHI_EE_AMSS             2               /* BHI_EXECENV: the firmware fully booted */
+
+#define MHI_CTXT_EL     44      /* one context element: 3 words + 4 qwords, packed */
+#define MHI_RING_EL     16      /* one ring element (struct mhi_tre) */
+#define MHI_RING_ELS    32      /* elements a ring is given: 512 bytes, its own alignment */
+
+#define MHI_ER_TYPE_VALID       1
+#define MHI_DEV_WAKE_DB         127     /* the doorbell past the last channel's, zeroed like the vendor's */
+
+static vm_offset_t mhi_ctxt_va;         /* contexts and rings in one piece of physical memory */
+static uint64_t mhi_ctxt_phys, mhi_ctxt_size;
+static uint32_t mhi_nch, mhi_ner;       /* what MHICFG said the device has */
+static vm_offset_t mhi_er_ctxt_va;      /* the event contexts inside the piece */
+static uint64_t mhi_er_ring_phys;       /* event ring 0: the device writes its events there */
+static uint64_t mhi_cmd_ctxt_phys, mhi_chan_ctxt_phys, mhi_er_ctxt_phys;
+static uint32_t mhi_chdboff, mhi_erdboff;
+
+static void
+ctxt64(vm_offset_t ctxt, uint32_t off, uint64_t value)
+{
+	/* the qword fields sit at 4-byte alignment in a packed context: two words each */
+	*(volatile uint32_t *)(ctxt + off) = (uint32_t)value;
+	*(volatile uint32_t *)(ctxt + off + 4) = (uint32_t)(value >> 32);
+}
+
+static void
+mhi_put64(int block, uint32_t off, uint64_t value, const char *name)
+{
+	put(block, name, off + 4, (uint32_t)(value >> 32));
+	put(block, name, off, (uint32_t)value);
+}
+
+static bool
+step_mhi_ready(void)
+{
+	uint32_t bhioff, ee = 0, ctrl = 0, status = 0, waited, cfg;
+
+	announce("the SBL running: the MHI's READY bit watched for, then its own counts read back");
+	bhioff = get(8, "mhi bhi off", MHI_BHIOFF);
+	/*
+	 * After the BHI transfer the endpoint is in SBL (execenv 1), not in AMSS: the AMSS is what the
+	 * SBL fetches through BHIE once MHI is ready, so 2 is not what this wait is for. qwx waits the
+	 * same way (ctrl's RESET bit 1 clear, status's READY bit 0 set) and so does mhi_pm.c's
+	 * mhi_ready_state_transition; the execution environment is only reported.
+	 */
+	for (waited = 0; waited < 100; waited++) {      /* up to ten seconds */
+		ctrl = rd(reg(8, MHI_MHICTRL));
+		status = rd(reg(8, MHI_MHISTATUS));
+		ee = rd(reg(8, bhioff + 0x28));
+		if (!(ctrl & MHI_CTRL_RESET) && (status & MHI_STATUS_READY)) {
+			break;
+		}
+		if ((waited % 10) == 0) {
+			line("mhi ctrl %#x, status %#x, execution environment %u after %u ms", ctrl, status, ee,
+			    waited * 100);
+		}
+		if (ctrl == 0xffffffffu || status == 0xffffffffu) {
+			say("the MHI registers read all ones: the endpoint is gone\n");
+			return false;
+		}
+		sleep_ms(100);
+	}
+	line("mhi ctrl %#x, mhi status %#x, execution environment %u after %u ms", ctrl, status, ee,
+	    waited * 100);
+	if ((ctrl & MHI_CTRL_RESET) || !(status & MHI_STATUS_READY)) {
+		say("no READY: the SBL did not raise it (ctrl %#x, status %#x, execenv %u)\n", ctrl, status, ee);
+		return false;
+	}
+	pause_group();
+	cfg = get(8, "mhi cfg (the device's counts)", MHI_MHICFG);
+	mhi_nch = cfg & 0xff;
+	mhi_ner = (cfg >> 16) & 0xff;
+	line("the device has %u channels, %u event rings (%u of them hardware, %u hardware channels)",
+	    mhi_nch, mhi_ner, cfg >> 24, (cfg >> 8) & 0xff);
+	if (mhi_nch == 0 || mhi_nch > 128 || mhi_ner == 0 || mhi_ner > 32) {
+		say("the counts do not look right (cfg %#x); going no further\n", cfg);
+		return false;
+	}
+	mhi_chdboff = get(8, "mhi chdb off", MHI_CHDBOFF);
+	mhi_erdboff = get(8, "mhi erdb off", MHI_ERDBOFF);
+	if (mhi_chdboff + 8 * (MHI_DEV_WAKE_DB + 1) >= MHI_MAP_SIZE ||
+	    mhi_erdboff + 8 * mhi_ner >= MHI_MAP_SIZE) {
+		say("the doorbell arrays reach past the mapped window; going no further\n");
+		return false;
+	}
+	return true;
+}
+
+/* step 16: the memory the device's DMA is given */
+
+static bool
+step_mhi_ctxt(void)
+{
+	uint64_t cmd_ring, er_ring, off;
+	vm_offset_t cmd_ctxt, chan_ctxt, er_ctxt;
+	kern_return_t kr;
+
+	announce("the MHI's memory: one contiguous piece for the context arrays, the command ring and "
+	    "the event rings, zeroed and filled in");
+	/*
+	 * The layout: the command ring first (page-aligned base is ring-aligned, 512 dividing 4096),
+	 * then the event rings, then, 128-aligned, the command context, the channel contexts (all zero:
+	 * DISABLED, as the vendor's freshly allocated array leaves them until a channel is started --
+	 * mhi_init_chan_ctxt runs per channel, after M0) and the event contexts.
+	 */
+	off = 0;
+	cmd_ring = off;
+	off += MHI_RING_ELS * MHI_RING_EL;
+	er_ring = off;
+	off += mhi_ner * MHI_RING_ELS * MHI_RING_EL;
+	off = (off + 127) & ~127ull;
+	cmd_ctxt = (vm_offset_t)off;
+	off += MHI_CTXT_EL;
+	chan_ctxt = (vm_offset_t)off;
+	off += mhi_nch * MHI_CTXT_EL;
+	er_ctxt = (vm_offset_t)off;
+	off += mhi_ner * MHI_CTXT_EL;
+	mhi_ctxt_size = round_page(off);
+	kr = kmem_alloc_contig(kernel_map, &mhi_ctxt_va, mhi_ctxt_size, 0, 0, 0,
+	    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT);
+	if (kr != KERN_SUCCESS) {
+		say("no contiguous memory for the MHI contexts (%llu bytes)\n", mhi_ctxt_size);
+		return false;
+	}
+	mhi_ctxt_phys = kvtophys(mhi_ctxt_va);
+	line("%llu bytes at physical %#llx: the rings first, the contexts from %#llx", mhi_ctxt_size,
+	    mhi_ctxt_phys, mhi_ctxt_phys + (uint64_t)cmd_ctxt);
+	mhi_er_ctxt_va = mhi_ctxt_va + er_ctxt;
+	mhi_er_ring_phys = mhi_ctxt_phys + er_ring;
+	mhi_cmd_ctxt_phys = mhi_ctxt_phys + (uint64_t)cmd_ctxt;
+	mhi_chan_ctxt_phys = mhi_ctxt_phys + (uint64_t)chan_ctxt;
+	mhi_er_ctxt_phys = mhi_ctxt_phys + (uint64_t)er_ctxt;
+	/* the command context: its ring, empty (rp = wp = base) */
+	ctxt64(mhi_ctxt_va + cmd_ctxt, 0x0c, mhi_ctxt_phys + cmd_ring);
+	ctxt64(mhi_ctxt_va + cmd_ctxt, 0x14, MHI_RING_ELS * MHI_RING_EL);
+	ctxt64(mhi_ctxt_va + cmd_ctxt, 0x1c, mhi_ctxt_phys + cmd_ring);
+	ctxt64(mhi_ctxt_va + cmd_ctxt, 0x24, mhi_ctxt_phys + cmd_ring);
+	for (uint32_t i = 0; i < mhi_ner; i++) {
+		vm_offset_t c = mhi_ctxt_va + er_ctxt + i * MHI_CTXT_EL;
+		uint64_t base = mhi_er_ring_phys + i * MHI_RING_ELS * MHI_RING_EL;
+
+		*(volatile uint32_t *)(c + 0x04) = MHI_ER_TYPE_VALID;   /* ertype; msivec 0: no MSI here */
+		ctxt64(c, 0x0c, base);
+		ctxt64(c, 0x14, MHI_RING_ELS * MHI_RING_EL);
+		ctxt64(c, 0x1c, base);
+		ctxt64(c, 0x24, base);
+	}
+	line("the command context and %u event contexts are filled; %u channel contexts left zero "
+	    "(disabled, as the vendor leaves them until a channel is started)", mhi_ner, mhi_nch);
+	pause_group();
+	return true;
+}
+
+/* step 17: the MMIO programming and the move to M0 */
+
+static bool
+step_mhi_m0(void)
+{
+	uint32_t cfg, status = 0, state = 0, waited;
+
+	announce("the MHI's MMIO: the context and window base registers, the event rings' doorbells rung, "
+	    "then the move to M0");
+	/*
+	 * mhi_init.c's mhi_init_mmio, with the physical addresses standing in for the iova (no SMMU
+	 * is programmed: the windows below say the device may touch exactly this piece).
+	 */
+	mhi_put64(8, MHI_CCABAP, mhi_chan_ctxt_phys, "ccabap (the channel contexts)");
+	mhi_put64(8, MHI_ECABAP, mhi_er_ctxt_phys, "ecabap (the event contexts)");
+	mhi_put64(8, MHI_CRCBAP, mhi_cmd_ctxt_phys, "crcbap (the command context)");
+	cfg = rd(reg(8, MHI_MHICFG));
+	put(8, "mhi cfg (the event ring count the host provides)", MHI_MHICFG,
+	    (cfg & ~0xff0000u) | (mhi_ner << 16));
+	mhi_put64(8, MHI_CTRLBASE, mhi_ctxt_phys, "ctrlbase");
+	mhi_put64(8, MHI_CTRLLIMIT, mhi_ctxt_phys + mhi_ctxt_size, "ctrllimit");
+	mhi_put64(8, MHI_DATABASE, mhi_ctxt_phys, "database");
+	mhi_put64(8, MHI_DATALIMIT, mhi_ctxt_phys + mhi_ctxt_size, "datalimit");
+	/* the wake doorbell, zeroed as the vendor zeroes it */
+	wr(reg(8, mhi_chdboff + 8 * MHI_DEV_WAKE_DB) + 4, 0);
+	wr(reg(8, mhi_chdboff + 8 * MHI_DEV_WAKE_DB), 0);
+	pause_group();
+	/*
+	 * mhi_ready_state_transition's last acts before M0: every event ring is given all of its
+	 * elements (wp = the last one), and its doorbell is rung with that pointer -- the high word
+	 * first, as mhi_write_db does.
+	 */
+	for (uint32_t i = 0; i < mhi_ner; i++) {
+		uint64_t wp = mhi_er_ring_phys + (i + 1) * MHI_RING_ELS * MHI_RING_EL - MHI_RING_EL;
+
+		ctxt64(mhi_er_ctxt_va + i * MHI_CTXT_EL, 0x24, wp);
+		wr(reg(8, mhi_erdboff + 8 * i) + 4, (uint32_t)(wp >> 32));
+		wr(reg(8, mhi_erdboff + 8 * i), (uint32_t)wp);
+	}
+	line("%u event rings rung", mhi_ner);
+	pause_group();
+	put(8, "mhi ctrl (M0)", MHI_MHICTRL, MHI_STATE_M0 << 8);
+	for (waited = 0; waited < 50; waited++) {       /* five seconds for the state to answer */
+		status = rd(reg(8, MHI_MHISTATUS));
+		state = (status >> 8) & 0xff;
+		if (state == MHI_STATE_M0 || (status & MHI_STATUS_SYSERR)) {
+			break;
+		}
+		if ((waited % 5) == 0) {
+			line("the MHI state is %u after %u ms (status %#x)", state, waited * 100, status);
+		}
+		sleep_ms(100);
+	}
+	line("the MHI state is %u after %u ms (status %#x)%s", state, waited * 100, status,
+	    (status & MHI_STATUS_SYSERR) ? ": SYSERR" : "");
+	if (state != MHI_STATE_M0) {
+		say("no M0\n");
+		return false;
+	}
+	/* what the device said while moving: event ring 0's elements up to the context's read pointer */
+	{
+		uint32_t rp_lo = *(volatile uint32_t *)(mhi_er_ctxt_va + 0x1c);
+		uint64_t done = (uint64_t)rp_lo - mhi_er_ring_phys;
+
+		line("event ring 0: the device read %llu bytes of events", done);
+		for (uint64_t e = 0; e < done && e < 4 * MHI_RING_EL; e += MHI_RING_EL) {
+			volatile uint32_t *tre = (volatile uint32_t *)(mhi_ctxt_va + e);
+
+			line("  event: %#x %#x %#x %#x", tre[0], tre[1], tre[2], tre[3]);
+		}
+	}
+	return true;
+}
+
 /* ---- what runs ------------------------------------------------------------------------------ */
 
 /*
@@ -1055,6 +1643,12 @@ static bool (*const steps[])(void) = {
 	step_clocks_dump,       /* 9  the whole PCIe0 corner of the clock controller */
 	step_parf,              /* 10 the wrapper's registers, once everything above is on */
 	step_ltssm,             /* 11 PERST out, the vendor's training words, the state machine on, the vendor's checks */
+	step_ep_cfg,            /* 12 the endpoint's config space, its BAR assigned, the iatu pointed at it */
+	step_mhi_look,          /* 13 the MHI and BHI registers behind the BAR */
+	step_bhi_amss,          /* 14 the WLAN firmware (amss20.bin) downloaded through BHI */
+	step_mhi_ready,         /* 15 the firmware's boot to AMSS, then the READY bit */
+	step_mhi_ctxt,          /* 16 the context arrays and rings, in one piece of physical memory */
+	step_mhi_m0,            /* 17 the MMIO bases programmed, the event rings rung, the move to M0 */
 };
 
 void
