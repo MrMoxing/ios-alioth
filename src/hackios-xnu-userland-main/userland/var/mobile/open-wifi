@@ -1,1 +1,0 @@
-open Settings on the Wi-Fi pane at boot, for the scan test (src/inject_sb.c, rc.jobs.wifiscan)

@@ -1,5 +1,5 @@
 diff --git a/wifi/lx/src/lx_80211.c b/wifi/lx/src/lx_80211.c
-index 32bde30..58b0bdb 100644
+index 32bde30..714c863 100644
 --- a/wifi/lx/src/lx_80211.c
 +++ b/wifi/lx/src/lx_80211.c
 @@ -82,6 +82,7 @@ struct lx_radio {
@@ -211,7 +211,24 @@ index 32bde30..58b0bdb 100644
  	}
  	at = rsn + 2;
  	end = at + rsn[1];
-@@ -1630,19 +1713,19 @@ station_join(struct lx_radio *radio, const struct hakios_sta_join *what)
+@@ -1586,8 +1669,14 @@ station_join(struct lx_radio *radio, const struct hakios_sta_join *what)
+ 	if (name_length == 0 || name_length > sizeof(radio->want)) {
+ 		return (EINVAL);
+ 	}
+-	if (what->security != HAKIOS_STA_WPA2_PSK) {
+-		lx_tell("lx: a network without WPA2 and a passphrase is asked for: that is not built\n");
++	/*
++	 * An open network is a network: it is asked for with no passphrase, and the path below joins it
++	 * without a key (protection() says *group_cipher = 0, the association request carries no RSN
++	 * element, and the four-way handshake is skipped). This check used to refuse it here, at the top
++	 * of the function, which is what Settings showed as "Unable to join the network".
++	 */
++	if (what->security != HAKIOS_STA_WPA2_PSK && what->security != HAKIOS_STA_OPEN) {
++		lx_tell("lx: a network of neither the WPA2 nor the open kind is asked for: that is not built\n");
+ 		return (ENOTSUP);
+ 	}
+ 	if (radio->sta != NULL) {
+@@ -1630,19 +1719,19 @@ station_join(struct lx_radio *radio, const struct hakios_sta_join *what)
  		lx_tell("lx: THE NETWORK THAT IS WANTED WAS NOT HEARD (a name of %u bytes), in three scans\n", name_length);
  		return (ENOENT);
  	}
@@ -238,7 +255,7 @@ index 32bde30..58b0bdb 100644
  	if (obstacle != NULL || channel == NULL || (channel->flags & IEEE80211_CHAN_DISABLED)) {
  		return (ENOTSUP);
  	}
-@@ -1650,19 +1733,27 @@ station_join(struct lx_radio *radio, const struct hakios_sta_join *what)
+@@ -1650,19 +1739,27 @@ station_join(struct lx_radio *radio, const struct hakios_sta_join *what)
  	/* the key of the name and the passphrase, and what the handshake needs besides */
  	began = lx_os_nanoseconds();
  	bzero(&radio->wpa, sizeof(radio->wpa));
@@ -273,7 +290,7 @@ index 32bde30..58b0bdb 100644
  
  	/* the access point's address, and its channel, 20 MHz wide */
  	vif->bss_conf.bssid = target->address;
-@@ -1743,7 +1834,7 @@ station_join(struct lx_radio *radio, const struct hakios_sta_join *what)
+@@ -1743,7 +1840,7 @@ station_join(struct lx_radio *radio, const struct hakios_sta_join *what)
  		}
  		frame = management(radio, frame, 0x00);
  		/* capabilities: an infrastructure network, protected, and of the access point's own what a station repeats */
@@ -282,7 +299,7 @@ index 32bde30..58b0bdb 100644
  		frame[1] = (uint8_t)((target->capability & 0x0500) >> 8);
  		frame[2] = 10;				/* we listen at least every tenth beacon */
  		frame[3] = 0;
-@@ -1789,6 +1880,19 @@ station_join(struct lx_radio *radio, const struct hakios_sta_join *what)
+@@ -1789,6 +1886,19 @@ station_join(struct lx_radio *radio, const struct hakios_sta_join *what)
  	    radio->sta->deflink.supp_rates[channel->band], radio->sta->deflink.ht_cap.ht_supported ? "yes" : "no",
  	    radio->sta->deflink.vht_cap.vht_supported ? "yes" : "no", radio->sta->deflink.rx_nss);
  
@@ -302,7 +319,7 @@ index 32bde30..58b0bdb 100644
  	/* the handshake: the access point begins it; its messages come in as frames and are answered where they come in */
  	began = lx_os_nanoseconds();
  	lx_os_lock();
-@@ -1818,6 +1922,7 @@ station_join(struct lx_radio *radio, const struct hakios_sta_join *what)
+@@ -1818,6 +1928,7 @@ station_join(struct lx_radio *radio, const struct hakios_sta_join *what)
  		error = -ret;
  		goto out;
  	}
@@ -310,7 +327,7 @@ index 32bde30..58b0bdb 100644
  	radio->reached = IEEE80211_STA_AUTHORIZED;
  	radio->sent = radio->sent_lost = radio->received = radio->received_group = radio->rekeys = 0;
  	radio->joined_at = lx_os_nanoseconds();
-@@ -1852,7 +1957,8 @@ lx_station_join(void)
+@@ -1852,7 +1963,8 @@ lx_station_join(void)
  	}
  	what.ssid_length = (uint8_t)name_length;
  	what.passphrase_length = (uint8_t)passphrase_length;
@@ -320,6 +337,126 @@ index 32bde30..58b0bdb 100644
  	lx_os_net_attach(radio->wiphy->perm_addr);
  	error = station_join(radio, &what);
  	explicit_bzero(&what, sizeof(what));
+diff --git a/xnu/files/bsd/dev/hakios.apple80211.c b/xnu/files/bsd/dev/hakios.apple80211.c
+index e07ad55..a0e185d 100644
+--- a/xnu/files/bsd/dev/hakios.apple80211.c
++++ b/xnu/files/bsd/dev/hakios.apple80211.c
+@@ -210,6 +210,8 @@ static const char interface_name[16] = "en0";   /* (bsd/dev/hakios.net.c makes o
+ static LCK_GRP_DECLARE(apple80211_lock_group, "hakios-apple80211");
+ static LCK_MTX_DECLARE(apple80211_lock, &apple80211_lock_group);
+ static unsigned result_next;                    /* which of what the last scan heard a SCAN_RESULT request gets next */
++/* iOS location hint only. The radio continues enforcing its firmware channel/power rules. */
++static uint8_t location_country[3] = { '0', '0', 0 };
+ static uint32_t join_result;                    /* of the last join asked for: 0 while it runs, then Apple80211's number */
+ 
+ /* ---- channels ---------------------------------------------------------------------------------------- */
+@@ -250,6 +252,56 @@ give(const struct apple80211req *request, const void *data, size_t length)
+ 	       request->req_len);
+ }
+ 
++/* These describe configured metadata, even when no network is associated.
++ * COUNTRY_CODE is a location hint; accepting one does not expand firmware channel permissions.
++ */
++static int
++get_country(const struct apple80211req *request)
++{
++	uint8_t country[3];
++
++	if (request->req_len < sizeof(country)) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&apple80211_lock);
++	memcpy(country, location_country, sizeof(country));
++	lck_mtx_unlock(&apple80211_lock);
++	return give(request, country, sizeof(country));
++}
++
++static int
++set_country(const struct apple80211req *request)
++{
++	struct { uint32_t version; uint8_t country[3], padding; } hint;
++	int error;
++
++	if (request->req_len != sizeof(hint)) {
++		return EINVAL;
++	}
++	if ((error = copyin(request->req_data, &hint, sizeof(hint))) != 0) {
++		return error;
++	}
++	if (hint.version != 1 || hint.country[2] != 0 ||
++	    !((hint.country[0] >= 'A' && hint.country[0] <= 'Z' && hint.country[1] >= 'A' && hint.country[1] <= 'Z') ||
++	    (hint.country[0] == '0' && hint.country[1] == '0'))) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&apple80211_lock);
++	memcpy(location_country, hint.country, sizeof(location_country));
++	lck_mtx_unlock(&apple80211_lock);
++	return 0;
++}
++
++static int
++get_auth(const struct apple80211req *request, const struct hakios_sta_state *state)
++{
++	struct { uint32_t version, lower, upper, extended; } answer = {
++	    .version = 1, .lower = 1, .upper = state->phase == HAKIOS_STA_JOINED ? 8 : 0
++	};
++
++	return give(request, &answer, sizeof(answer));
++}
++
+ /* An access point in the form a scan's result has; the caller has said how much room for elements there is. */
+ static int
+ give_network(const struct apple80211req *request, const struct hakios_sta_bss *bss)
+@@ -374,6 +426,8 @@ get(struct apple80211req *request)
+ 		kfree_data(answer, sizeof(*answer));
+ 		return error;
+ 	}
++	case 51:                                /* location country: iOS 16.5 requests the three bytes without a version */
++		return get_country(request);
+ 	case 21:                                /* how the last join went (0: not over yet) */
+ 		lck_mtx_lock(&apple80211_lock);
+ 		request->req_val = (int32_t)join_result;
+@@ -446,14 +500,9 @@ get(struct apple80211req *request)
+ 	case 103:                               /* all of it, as a scan's result */
+ 		error = state->phase != HAKIOS_STA_JOINED ? ENXIO : give_network(request, &state->bss);
+ 		break;
+-	case 2: {                               /* how it was joined: open system, then WPA2 with a passphrase */
+-		struct {
+-			uint32_t version, lower, upper, extended;
+-		} answer = { .version = 1, .lower = 1, .upper = 8 };
+-
+-		error = state->phase != HAKIOS_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
++	case 2:                                 /* authentication metadata remains readable while disconnected */
++		error = get_auth(request, state);
+ 		break;
+-	}
+ 	default:
+ 		error = EOPNOTSUPP;
+ 		break;
+@@ -548,6 +597,14 @@ set_join(const struct apple80211req *request, char *said, size_t said_size)
+ 	what->ssid_length = (uint8_t)asked->ssid_length;
+ 	memcpy(what->ssid, asked->ssid, asked->ssid_length);
+ 	memcpy(what->bssid, asked->bssid, sizeof(what->bssid));
++	/*
++	 * Every join request that reaches the kernel says so, with the kind of protection it named:
++	 * a key of 0 bytes is an open network (Settings' "Unable to join" was here or above this line,
++	 * and this line is how the two were told apart).
++	 */
++	printf("apple80211: a join was asked for: a name of %u bytes, a key of %u bytes of kind %u, so %s\n",
++	    asked->ssid_length, asked->key_length, asked->key_cipher,
++	    asked->key_length == 0 ? "AN OPEN NETWORK" : "a protected one");
+ 	if (asked->key_length == 0) {
+ 		what->security = HAKIOS_STA_OPEN;
+ 	} else if (asked->key_cipher == CIPHER_PASSPHRASE && asked->key_length >= 8 && asked->key_length <= 63) {
+@@ -581,6 +638,8 @@ static int
+ set(const struct apple80211req *request, char *said, size_t said_size)
+ {
+ 	switch (request->req_type) {
++	case 51:
++		return set_country(request);
+ 	case 20:
+ 		return set_join(request, said, said_size);
+ 	case 22:                                /* leave the network */
 diff --git a/xnu/files/bsd/dev/hakios.radio.c b/xnu/files/bsd/dev/hakios.radio.c
 index 5cfb57c..221039b 100644
 --- a/xnu/files/bsd/dev/hakios.radio.c
