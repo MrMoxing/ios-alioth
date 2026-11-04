@@ -81,7 +81,80 @@ pcie_step=31 pcie_ipcr=2 wifi_lx=2 wifi_station=1
 **工具链复用**：`cp -al ~/k40/xnu-deps ~/hakios-ref/xnu-deps`（硬链接，530 MB 不重复占盘），
 `tcsh`/`csh` 本来就在那份 deps 的 `host/bin` 里——`doconf` 需要的正是它。
 
-## 5. 风险与未知
+## 5. 上机实录（2026-11-04 13:1x–13:2x，真机，我们的 loader + 我们的 system.apfs）
+
+参考内核直接跑在**我们现有的上机装置**上（`boot/alioth-boot.img` + `boot/system.apfs` + 我们的 init），
+没有换 loader、没有换系统镜像。三轮：
+
+| 轮 | payload | 结果 |
+|---|---|---|
+| `refwifi` | 参考内核 + 我们的 root.apfs（**fw 名字不对**） | 桌面起来了，pcie 走到 step 31 后 `pinned device firmware absent; no DMA` |
+| `refwifi2` | + `qca6390_*` 四个固件 | **整条 Wi-Fi 栈跑通到"驱动起来了"**，只差 MAC（见下） |
+| `refwifi3` | + `wifi_mac=<本机 MAC>` | 见 §5.2 |
+
+### 5.1 refwifi2 的关键日志（`runs/refwifi2.log.txt`，1.3 MB）
+
+```
+pcie: 28: endpoint 01:00.0: id 0x110117cb (vendor 0x17cb, device 0x1101)
+pcie: 29: BAR0 mask 0xffffffff:0xfff00004, size 0x100000
+pcie: 29: BAR0 0x60300004, command 0x2; DMA disabled
+pcie: 29: MHI len 0x100 ... BHI offset 0x100, BHIE offset 0x224, chdb 0x300, erdb 0x700
+pcie: 30: apps SMMU scr0 0x270406, idr0 0x4c017e57, idr1 0x6000004a, SID 0x1c01
+pcie: 30: SID 0x1c01 -> match 7 context 6, root 0x6000191a04000; isolated 0xc00000-byte DMA mapping
+pcie: 31: PBL reset acknowledged before BHI; ctrl 0 status 0
+pcie: 30: requested signed SBL transfer (512 KiB) through BHI
+pcie: 31: after SBL transfer MHI status 0x101, execenv 0x1, version 0x1000000
+pcie: 31: MHI cfg 0x30880, context bases 0xa0000000/0xa0002000/0xa0003000
+pcie: 31: after M0 MHI status 0x201, execenv 0x1
+pcie: 31: requested 4352144-byte AMSS transfer in 9 BHIE vectors
+pcie: 31: BHIE status 0x9e7f6f75, execenv 0x2, MHI status 0x201
+pcie: 31: mission observation MHI status 0x201, execenv 0x2, stable M0 2000 ms
+ath11k: fw_version 0x1016046e fw_build_timestamp 2023-10-12 01:51 ... QCAHSTSWPL_SILICONZ
+ath11k (debug): BDF download sequence completed
+ath11k (debug): firmware init done / firmware start / wlan cfg req / wlan mode req mode 0
+lx: the driver registers a radio: channels: 14 in band 0, 28 in band 1, 60 in band 3
+lx: the regulatory domain "CN" (4 rules) allows the radio's channels: 13 of 14 in band 0 ...
+lx: 249 ms after its start the driver IS UP as far as it is built: the firmware has said "unified ready"
+lx: its address, by the firmware: 00:00:00:00:00:00
+lx: THE RADIO HAS NO ADDRESS (the kernel was given none, and the firmware has none): no interface is made
+ath11k (debug): firmware stop / wlan mode req mode 4
+pcie: 35: ath11k returned 49
+```
+
+**这就是答案**：整套照搬在本机是可行的——BHI 的 512 KiB SBL、BHIE 的 9 段 AMSS、QMI 的 board/regdb/m3、
+ath11k 的 pdev 起、固件"unified ready"、射频通道表、CN 监管域，全部走通。
+唯一断掉的一处是 **MAC 地址**：固件报 `00:00:00:00:00:00`，`lx` 于是不建接口。
+
+`wifi_mac` 是参考实现自己的开机参数（`hakios.radio.c` 用 `PE_parse_boot_arg_str("wifi_mac", …)`，
+要求 17 个字符）；本机真 MAC 从 Android 的 `/mnt/vendor/persist/wlan_mac.bin` 读出
+（`wlan0=6cf7848b81b0`），`refwifi3` 带的就是它。
+
+### 5.2 refwifi3：`wifi_mac` 一给，接口就出来了
+
+```
+wifi: station address supplied and validated
+lx: early station interface attached 1
+net_test: wifi: en0 is there after 0.0 s
+net_test: wifi: configd has a network service for en0 after 1.4 s: it configures it itself
+lx: coherent allocation 6160384 bytes at IOVA 0xa1020000 …（AMSS/M3 的段、rings、copy engines）
+lx: the rings are set up and the copy engines have their buffers: the bus is started
+lx: 257 ms after its start the driver IS UP as far as it is built: the firmware has said "unified ready"
+pcie: 35: ath11k returned 0
+pcie: 36: station offered to iOS; keeping isolated endpoint until session return
+```
+
+**结论：整套照搬在本机可行。** 参考内核 + 我们的 loader + 我们的 iOS 镜像，开机进桌面，
+`en0` 建起来、`configd` 自己给它配了网络服务、ath11k 以 0 返回、station 交给 iOS
+（截图 `runs/refwifi3-1.png`：桌面正常，状态栏还没有 Wi-Fi 图标——扫描要进
+Settings → Wi-Fi 才会发生，这一步还没做）。
+
+### 5.3 下一步
+
+1. 进 Settings → Wi-Fi 看是否扫到 SSID（可以用 `rwtouch` 点，或手动点）。
+2. 能扫到就把网络写进 `fw/network`（参考实现的 `lx_os_network`：第一行 SSID、第二行密码）试连。
+3. 决定：整包采用，还是把 §7 的四条补进我们自己的 `alioth_pcie.c`。
+
+## 6. 风险与未知
 | 风险 | 影响 | 备注 |
 |---|---|---|
 | 两份源码下不下来（400 MB） | 整个方案停在构建 | 只此一处外部依赖；失败可换镜像/离线包 |
@@ -90,7 +163,7 @@ pcie_step=31 pcie_ipcr=2 wifi_lx=2 wifi_station=1
 | 系统镜像 | 可能仍可用我们的 `boot/system.apfs` | 同一 iOS 16.5 rootfs；但 `en0` 需要 `wifid` 起来，且 `apple80211` 的接口名要对上 |
 | 与我们自己的 `alioth_pcie.c` 冲突 | 两套 PCIe 驱动同时编进内核 | 照搬时应把我们的从内核配置里摘掉 |
 
-## 6. 与我们自己路线的对照（这次照搬最该带走的东西）
+## 7. 与我们自己路线的对照（这次照搬最该带走的东西）
 
 即便最后不整包采用，下面四条是我们自己那份 `alioth_pcie.c` 必须补的，且已被参考实现验证过：
 
@@ -102,7 +175,7 @@ pcie_step=31 pcie_ipcr=2 wifi_lx=2 wifi_station=1
    `qca_wait_pbl_reset`（`MHICTRL` bit1 清、`MHISTATUS` bit4 清）——"MHI RESET 还没清就写 BHI 描述符"会被丢掉。
 4. **MSI 与轮询两种都要**：`BHI_INTVEC=0` 走轮询；`qca_boot_msi` 给的是 MHI 的 MSI 目标。
 
-## 7. 本分支的边界
+## 8. 本分支的边界
 
 - 分支 `wifi-ref-port` 只放：本文件、构建脚本（`ubuntu/ref-wifi-build.sh`）、以及照搬过程中的适配提交。
 - 不合入 `main`：`main` 上的 `alioth_pcie.c` 路线继续推进，二者不混编。
