@@ -1,0 +1,15 @@
+# What the language of this port is made of, asked from inside a run:
+#   - the live per-user domain, the whole of it (AppleLanguages, AppleLocale),
+#   - the system domain, which this boot is the first to create,
+#   - and what CoreFoundation inside SpringBoard makes of them (inject_sb.c, language_state), at
+#     start with lang_probe=1, then again on the notification below.
+# The shot taken with this run shows the strings.
+/redwood/bin/var_store cat /private/var/mobile/Library/Preferences/.GlobalPreferences.plist 1400
+/redwood/bin/var_store cat /private/var/preferences/.GlobalPreferences.plist 1400
+/redwood/bin/var_store cat /private/var/root/Library/Preferences/.GlobalPreferences.plist 1400
+# What SpringBoard itself answered, once the home screen is up and the language has had time to
+# settle: the same question the 25 s sample inside the process asks, from outside it.
+sleep 40
+/redwood/bin/rwtouch notify com.redwood.lang
+sleep 5
+/redwood/bin/var_store cat /private/var/mobile/Library/Preferences/.GlobalPreferences.plist 400

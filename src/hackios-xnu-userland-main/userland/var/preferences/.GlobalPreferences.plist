@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- This device's user reads Chinese: the system language, the locale everything formats
+	     dates and numbers with, and the keyboards on the first screen. It is seeded here rather
+	     than set in Setup, which on this port never ran ("setup assistant refused"), so without
+	     a seed every process answers in English and the keyboard is English only.
+	     zh-Hans-CN first: an application that knows the region form picks it; zh-Hans after it
+	     for the ones that only know the language; en last, as the fallback everything knows. -->
+	<key>AppleLanguages</key>
+	<array>
+		<string>zh-Hans-CN</string>
+		<string>zh-Hans</string>
+		<string>en</string>
+	</array>
+	<key>AppleLocale</key>
+	<string>zh_CN</string>
+	<!-- The two keyboards the user needs from the first unlock: Pinyin first, QWERTY behind it
+	     for the Latin logins. Without this list UIKit builds an English keyboard only, and
+	     changing it later needs the Settings keyboard pane, which works but starts English. -->
+	<key>AppleKeyboards</key>
+	<array>
+		<string>zh_Hans-Pinyin@sw=Pinyin;hw=Automatic</string>
+		<string>en_US@sw=QWERTY;hw=Automatic</string>
+	</array>
+	<!-- The metered keys of .GlobalPreferences that iOS reads before any application runs:
+	     the metric system and 24-hour time, which a zh_CN locale asks for. -->
+	<key>AppleMetricUnits</key>
+	<true/>
+	<key>AppleICUForce24HourTime</key>
+	<true/>
+	<key>AppleMeasurementUnits</key>
+	<string>cm</string>
+	<key>AppleTemperatureUnit</key>
+	<string>Celsius</string>
+</dict>
+</plist>
