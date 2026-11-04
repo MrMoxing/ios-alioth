@@ -24,8 +24,12 @@ echo "== the payload: their kernel, our images"
 K=$REF/xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
 ls -l "$K" | sed 's/^/  /'
 EPOCH=$(date +%s)
+# JOIN=1: the station joins the network named in fw/network by itself (wifi_join=1, hakios.radio.c)
+# and stays joined for HOLD seconds; without it the station is offered to iOS and Settings joins.
+WIFI="wifi_station=1 wifi_keep=1"
+[ -n "$JOIN" ] && WIFI="wifi_join=1 wifi_hold=${HOLD:-120}"
 python3 /home/mrmoxing/k40/xnuloader/mkpayload.py -o /mnt/e/Productivity/WorkBuudy/ios-alioth/boot/run-payload-refwifi.bin \
 	kernel="$K" ramdisk=root.apfs \
-	--cmdline "loader_return_after=180 epoch=$EPOCH sb_delay=8 touchscreen=1 buttons=1 touch_stat=5 cpufreq=1 bootcpu=7 cpus=8 adreno_soc=a650 adreno=21 adreno_skip=0 adreno_pause=0 adreno_keep=1 adreno_watch=10 ufs=2 ufs_write=1 var_store=1 pcie_step=31 pcie_at=2 pcie_ipcr=2 wifi_lx=2 wifi_quiet=1 wifi_station=1 wifi_keep=1 wifi=1 wifi_mac=6c:f7:84:8b:81:b0"
+	--cmdline "loader_return_after=${LRA:-180} epoch=$EPOCH sb_delay=8 touchscreen=1 buttons=1 touch_stat=5 cpufreq=1 bootcpu=7 cpus=8 adreno_soc=a650 adreno=21 adreno_skip=0 adreno_pause=0 adreno_keep=1 adreno_watch=10 ufs=2 ufs_write=1 var_store=1 pcie_step=31 pcie_at=2 pcie_ipcr=2 wifi_lx=2 wifi_quiet=1 $WIFI wifi=1 wifi_mac=6c:f7:84:8b:81:b0"
 echo "epoch=$EPOCH"
 ls -l /mnt/e/Productivity/WorkBuudy/ios-alioth/boot/run-payload-refwifi.bin | sed 's/^/  /'

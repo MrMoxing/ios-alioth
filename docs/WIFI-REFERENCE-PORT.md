@@ -227,6 +227,70 @@ for (int left = seconds * 5; left > 0; left--) usleep(200000);
 驱动自己连，不需要设置页；或者跑一轮不自动返回的（`SECS` 长、`REBOOT=0`），由人手动点开 Wi-Fi 面板，
 再从日志里读扫描结果。
 
+### 5.3.3 开放网络（无密码）连不上：参考实现根本不收（15:2x 定案）
+
+校园网 `SDP-WeNet` 在 Settings 里点下去得到 **"Unable to join the network"**，而热点的 WPA2 一次就通。
+原因不在固件，在 `wifi/lx/src/lx_80211.c` 的 `protection()`：
+
+```c
+if (rsn == NULL) {
+    return (target->capability & 0x10 ? "it is protected by something older than WPA2" : "it is not protected at all: an "
+           "open network is not joined by this");
+}
+```
+
+**一个 beacon 里没有 RSN 元素，就是开放网络；这个分支直接把它拒了**（返回 `ENOTSUP`），
+`hakios.apple80211.c` 把 `key_length == 0` 的请求标成 `HAKIOS_STA_OPEN` 之后照样走到这里，
+于是 iOS 只能报"无法加入"。参考项目自己验证的是 WPA2-PSK，这条路它没走过。
+
+修法（`ubuntu/ref-open-network.patch`，四处，都不改变 WPA2 行为）：
+
+| 位置 | 改动 |
+|---|---|
+| `protection()` | 无 RSN 且不声称加密 → `*group_cipher = 0` 并放行；声称加密却没有 RSN（WEP）仍旧拒绝 |
+| `request_elements()` | 只有 `group_cipher != 0` 才带 RSN 元素，开放网络"什么都不说" |
+| 关联请求 capabilities | Privacy 位跟着网络走：`0x01` + 有密钥时 `0x10` |
+| 握手与密钥 | `group_cipher == 0` 时跳过四步握手与 `set_key`，直接 `ASSOC → AUTHORIZED`，然后照常 `THE NETWORK IS JOINED` |
+
+**另一处**：`hakios.radio.c` 的 `hakios_wifi_network()` 在这个机型上是**空桩**（`return false`），
+所以 `wifi_join=1`（读 `fw/network` 自连）从来没生效过——只有 iOS 从 Settings 发起的连接是真的。
+现在它从 `fw/network` 读：第一行网络名，第二行密码，**第二行空=开放网络**。
+
+**一个必须记住的副作用**：`wifi_join=1` 是"内核自己连"，射频**不交给 iOS**（走的是 `lx_station_join`，
+不是 `lx_station_offer`），所以 Settings 里的 Wi-Fi 开关是灰的、打不开；`wifi_hold` 一到驱动还会收掉，
+界面就彻底没有无线电了。要 iOS 能用开关，必须是 `wifi_station=1 wifi_keep=1`。
+
+### 5.3.4 "连上了但浏览器打不开网页"：这台机器上没有 DHCP，也没有 DNS
+
+`en0` 关联成功、帧可以过，但浏览器说 "the server can't be found"，日志里同时有：
+
+```
+failed lookup: name = com.apple.networkd_privileged, requestor = configd[9],  error = 3: No such process
+failed lookup: name = com.apple.networkd_privileged, requestor = wifid[11],  error = 3: No such process   (4 次)
+```
+
+**`com.apple.networkd_privileged` 在这份 iOS 16.5 卷里根本不存在**：`/usr/libexec/networkd`、
+`com.apple.networkd.plist` 在完整清单（`ios165/rootfs.slt`，763 万行）里都没有，
+System Cryptex 里也没有（那里只有 `usr/lib`）。iOS 16 的 DHCP 客户端就是这个守护进程，
+没有它 → 没有地址、没有 DNS 服务器 → Safari 只能报"找不到服务器"。
+`mDNSResponder`（解析器本身，1.4 MB）在镜像里、job 也在，但**从来没进过 job 列表**，已加（`MDNS=1` 默认开）。
+
+**更正（15:41 实测）**：地址和解析**其实是通的** —— 桌面截图里 Safari 已经加载出 `sina.com.cn`
+（`runs/openfix-1.png`），说明 DNS 解析成功、TCP 连上、TLS 握手也走到了证书那一步。
+真正卡住的是证书：日志里 **76 次 `failed lookup: name = com.apple.trustd, requestor = com.apple.WebKit`**，
+`trustd`（判证书的守护进程）不在 job 列表里，WebKit 得到"没人负责评判"，Safari 就显示
+"This Connection Is Not Private"。镜像里 `usr/libexec/trustd` 和它的 plist 都在，已加进列表（`TRUSTD=1`）。
+`com.apple.networkd_privileged` 那五条查找仍然存在，但没有挡住地址与 DNS —— 说明这条路径上
+configd 自己做了这件事（至少对 WPA2 热点）。
+
+能拿到的结论：**"能上网"这条链差的不是驱动，是地址与解析**。三条可行路：
+
+1. **自己写一个 DHCP 客户端**（BPF 收发包 + `SIOCAIFADDR` + 路由 socket），顺手把 DNS 写进 configd 的动态存储，
+   最完整，工作量也最大。
+2. **静态地址**：`en0` 用固定 IP/网关/DNS（校园网段内可行），configd 的 `preferences.plist` 里给这个服务写死——
+   不需要 DHCP，但每换一个网络就得改。
+3. **换一个带 `networkd` 的 iOS 版本/卷**（16.5 之后的卷里它可能在 System Cryptex 里），最省事但要重做镜像。
+
 ### 5.4 扫到、并且连上了（15:1x，真机，`runs/wifihand3.log.txt`）
 
 手动点开 Settings → Wi-Fi（这一步自动化做不了，原因见 §5.3），射频侧一次就到位：

@@ -133,6 +133,17 @@ IOS_JOBS=${JOBS-"
 # (Count a QEMU run log with its duplicate lines removed: run-ios.sh prints launchd's log twice.)
 # WIFID=0 leaves it out.
 [ "${WIFID-1}" != 0 ] && IOS_JOBS="$IOS_JOBS com.apple.wifid"
+# com.apple.mDNSResponder is the resolver: every name that is not a literal address is asked of it,
+# and with nothing answering, Safari's answer to any page is "the server cannot be found" -- which
+# is what a joined network looked like before this line existed. The program and its job are in the
+# image (usr/sbin/mDNSResponder, 1.4 MB); what it still wants is a DNS server to ask, which comes
+# from the network's DHCP lease, and that is the piece this image has not got (see the note on
+# com.apple.networkd_privileged in docs/PROJECT-PLAN.md).
+[ "${MDNS-1}" != 0 ] && IOS_JOBS="$IOS_JOBS com.apple.mDNSResponder"
+# com.apple.trustd is what judges a TLS certificate: WebKit asks it, and with nothing answering the
+# answer it gets back is "not trusted", which Safari shows as "This Connection Is Not Private" --
+# 76 failed lookups of com.apple.trustd in one session (openfix, 15:39) and not one page that loaded.
+[ "${TRUSTD-1}" != 0 ] && IOS_JOBS="$IOS_JOBS com.apple.trustd"
 # The programs (file names) started with a library of ours inside them: "LIBRARY NAME..." per line
 # (src/inject.c is libredwood.dylib, src/inject_sb.c is libredwood-sb.dylib, src/inject_media.c is
 # libredwood-media.dylib).
@@ -599,6 +610,15 @@ if [ -n "$QCA" ] && [ -d ../fw-qca ]; then
 	install -m 0644 ../fw-qca/m3.bin root/fw/qca6390_m3.bin
 	install -m 0644 ../fw-qca/bdwlan.elf root/fw/qca6390_bd_k11a.elf
 	install -m 0644 ../fw-qca/regdb.bin root/fw/qca6390_regdb.bin
+fi
+# ... and the network the reference implementation's station joins by itself (wifi_join=1): a name on
+# the first line of fw/network, a passphrase on the second, and an empty second line for an open
+# network (hakios.radio.c's hakios_wifi_network, wifi/lx/src/lx_80211.c's lx_station_join). It is the
+# one file of fw/ that names a place rather than a piece of hardware, so it is not in the repository:
+# ../fw-net/network, made by hand for the network in reach.
+if [ -f ../fw-net/network ]; then
+	mkdir -p root/fw
+	install -m 0644 ../fw-net/network root/fw/network
 fi
 # ... and the vibration motor's waveforms, the phone's /vendor/firmware/aw8697_haptic.bin, from ../fw-haptic
 # (bsd/dev/redwood_haptic.c, haptic=3; 3.6 KB, the vendor's and not in the repository either)
