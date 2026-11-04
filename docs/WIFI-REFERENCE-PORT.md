@@ -148,7 +148,26 @@ pcie: 36: station offered to iOS; keeping isolated endpoint until session return
 （截图 `runs/refwifi3-1.png`：桌面正常，状态栏还没有 Wi-Fi 图标——扫描要进
 Settings → Wi-Fi 才会发生，这一步还没做）。
 
-### 5.3 下一步
+### 5.3 扫描这一步没拿到（四次尝试，13:39–14:17）
+
+iOS 只在 **Wi-Fi 面板打开时**才让 wifid 去扫描，所以问题是"把设置页打开"。四次都没成：
+
+| 尝试 | 做法 | 结果 |
+|---|---|---|
+| `wifiscan` | 20 s 时 `rwtouch` 直接点 Settings 图标 | 没反应；后来发现 **锁屏还没滑走**，点在锁屏上 |
+| `wifiscan3` | 通知 `com.redwood.wifi`，注入库用 `LSApplicationWorkspace` 开 `App-Prefs:root=WIFI` | 处理函数一句话都没打印，通知没送到 SpringBoard |
+| `wifiscan4` | 开机参数 `open_wifi=1` 定时 30/60 s 触发 | 也没有打印——**参考内核里 `sysctlbyname("kern.bootargs")` 不回答**，开关根本没被读到 |
+| `wifiscan5` | 场景先 `var_store stamp /private/var/mobile/open-wifi`，注入库在 25/55 s 检查该文件 | 文件确实建了（`29 bytes added`），注入库仍无输出 |
+| `wifiscan6` | 按 `rc.jobs.launch` 已验证的序列：40 s 上滑解锁 → 46 s 点 (0.615, 0.71) → 52 s 点 Wi-Fi 行 | **SpringBoard 在 14:14:52 重启了**（pid 8 → 99），截图正好抓在 BootUI 的转圈上；没有扫描 |
+
+`wifiscan5/6` 说明两件事：注入库本身是加载的（`redwood: SpringBoard: …` 有），但**延时块在参考内核上没执行**，
+而 `wifiscan6` 的 SpringBoard 重启把界面重置了。这一层（自动化点 UI）比修驱动更费时间，先停在这里。
+
+**更省的办法**：把网络写进 `fw/network`（参考实现的 `lx_os_network`：第一行 SSID、第二行密码），
+驱动自己连，不需要设置页；或者跑一轮不自动返回的（`SECS` 长、`REBOOT=0`），由人手动点开 Wi-Fi 面板，
+再从日志里读扫描结果。
+
+### 5.4 下一步
 
 1. 进 Settings → Wi-Fi 看是否扫到 SSID（可以用 `rwtouch` 点，或手动点）。
 2. 能扫到就把网络写进 `fw/network`（参考实现的 `lx_os_network`：第一行 SSID、第二行密码）试连。

@@ -1407,6 +1407,43 @@ language_state(const char *when)
 	}
 }
 
+/*
+ * Settings, on a page of our choosing: the notification com.redwood.wifi opens Settings' Wi-Fi pane,
+ * which is the only thing that makes wifid ask the radio for a scan. LaunchServices is reached the
+ * way Apple's own code reaches it (LSApplicationWorkspace, a private framework SpringBoard has
+ * loaded), and the URL scheme "App-Prefs:" is the one Settings registers for exactly this.
+ *
+ * The touch path is not used for it: replaying touches through /dev/redwood-touch works for a
+ * home-screen swipe (rc.jobs.unlock), but a tap that has to land on an icon depends on where
+ * SpringBoard put it -- and on the reference kernel the pane never came up that way (wifiscan).
+ */
+static void
+open_wifi_settings(void)
+{
+	Class workspace_class = objc_getClass("LSApplicationWorkspace");
+	id workspace, url;
+	SEL default_workspace, open_url;
+
+	if (workspace_class == Nil) {
+		say("redwood: no LSApplicationWorkspace in this process; Settings cannot be asked by URL\n");
+		return;
+	}
+	default_workspace = sel_registerName("defaultWorkspace");
+	open_url = sel_registerName("openSensibleApplicationURL:");
+	workspace = ((id (*)(Class, SEL))objc_msgSend)(workspace_class, default_workspace);
+	url = (id)CFURLCreateWithString(NULL, CFSTR("App-Prefs:root=WIFI"), NULL);
+	if (workspace == nil || url == NULL) {
+		say("redwood: Settings could not be opened by URL\n");
+		if (url != NULL) {
+			CFRelease((CFTypeRef)url);
+		}
+		return;
+	}
+	say("redwood: opening Settings' Wi-Fi pane\n");
+	((BOOL (*)(id, SEL, id))objc_msgSend)(workspace, open_url, url);
+	CFRelease((CFTypeRef)url);
+}
+
 __attribute__((constructor))
 static void
 redwood_springboard_init(void)
@@ -1468,6 +1505,24 @@ redwood_springboard_init(void)
 		char arguments[1024] = "";
 		size_t size = sizeof(arguments) - 1;
 
+		/*
+		 * Settings' Wi-Fi pane, on a marker file the run itself makes
+		 * (rc.jobs.wifiscan: var_store stamp /private/var/mobile/open-wifi). Two reasons it is
+		 * not decided here and now: SpringBoard is still laying out its icons this early, and the
+		 * marker does not exist yet at this point of the boot either. The checks are late ones.
+		 */
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 25 * NSEC_PER_SEC),
+		    dispatch_get_main_queue(), ^{
+			if (access("/private/var/mobile/open-wifi", F_OK) == 0) {
+				open_wifi_settings();
+			}
+		});
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 55 * NSEC_PER_SEC),
+		    dispatch_get_main_queue(), ^{
+			if (access("/private/var/mobile/open-wifi", F_OK) == 0) {
+				open_wifi_settings();
+			}
+		});
 		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 &&
 		    strstr(arguments, "lang_probe=1") != NULL) {
 			language_state("at start");
@@ -1574,6 +1629,9 @@ redwood_springboard_init(void)
 	});
 	notify_register_dispatch("com.redwood.switcher", &token, dispatch_get_main_queue(), ^(__unused int t) {
 		switcher();
+	});
+	notify_register_dispatch("com.redwood.wifi", &token, dispatch_get_main_queue(), ^(__unused int t) {
+		open_wifi_settings();
 	});
 	notify_register_dispatch("com.redwood.button.volume_up", &token, dispatch_get_main_queue(), ^(__unused int t) {
 		volume_button(true);
