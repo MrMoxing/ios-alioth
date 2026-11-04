@@ -1,4 +1,4 @@
-# 项目计划（2026-11-04 15:0x）
+# 项目计划（2026-11-04 16:1x）
 
 > 这份文档只回答两件事：**现在到哪了**、**接下来按什么顺序打**。
 > 实证记录在 `docs/SESSION-HANDOFF.md`（每条都有真机日志时间戳），文件地图在 `docs/PROJECT-MAP.md`。
@@ -15,7 +15,7 @@
 | 存储读取 | ✅ 完成 | 根卷报 20 GiB / 12.2 GiB 可用（`df` 实测，§13.13） |
 | 存储持久化 | ✅ 完成 | `/private/var` 跨重启保留（§13.15，真机六轮，提交 `9c7b712`） |
 | Settings → Wi-Fi 面板 | ✅ 完成 | 补了 configd / securityd / wifianalyticsd，面板能进（提交 `885af0d`） |
-| **Wi-Fi 无线电** | 🟢 快通了 | 链路 L0、固件到 AMSS、`en0`、**扫到 14 个热点、WPA2 关联成功、帧可以通过**（15:1x 真机）；只差 DHCP 地址 |
+| **Wi-Fi 无线电** | ✅ **通** | 链路 L0 → 固件 AMSS → `en0` → **扫到 14 个热点** → **WPA2 关联 + 四步握手** → **开放网络可加入** → **Safari 打开 https 页面**（`bing.com`，带锁）。§13.19 |
 | **系统语言 → 中文** | 🔍 取证中 | 偏好确实进到 SpringBoard（进程内实测）；卡在 bundle 认定（§13.16） |
 | **默认壁纸** | ❌ 未通 | PosterBoard 从未运行，扩展每次都崩 |
 | **真熄屏** | ❌ 未通 | 黑帧但面板仍通电（DCS 0x28 从未发过） |
@@ -99,31 +99,29 @@
 
 **验收**：主屏 / Settings 文字变中文，**且重启后仍是中文**（这条以前无法验证）。
 
-### P0-2 Wi-Fi（主线，剩下的最后一层）
+### P0-2 Wi-Fi（已通，收尾阶段）
 
-**已通的（真机）**：
+**已通（全部真机，§13.19）**：链路 L0 → BHI 512 KiB SBL → MHI M0 → BHIE 4.3 MB AMSS →
+`unified ready` → QMI 下 BDF/board/m3 → `en0` → 扫描 14 个热点 → WPA2 关联与四步握手 →
+开放网络可加入 → Safari 打开 https 页面（`bing.com`，带锁）。
 
-| 层 | 证据 | 在哪条路线 |
+**这一层是怎么通的**：整包采用参考实现（`Klipboard2022/k40-ios-experiments`：Linux 7.0.14 的
+ath11k 原样编进 XNU），而不是继续给自研 `alioth_pcie.c` 补 SMMU/BHIE/QRTR/802.11 状态机。
+分支 `wifi-ref-port` 已快进合并进 `main`。
+
+**剩下的三件事，按顺序**：
+
+| # | 事 | 判据 |
 |---|---|---|
-| 链路 L0 | `parf_ltssm 0x111`、端点 `17cb:1101` | 我们自己的 `alioth_pcie.c`（`24f4d4a`）与照搬路线都有 |
-| 固件搬运 | BHI 512 KiB SBL → MHI M0 → BHIE 4,352,144 B AMSS（9 段）→ `execenv 0x2` | 照搬路线（§13.18） |
-| 协议栈 | QMI 下 BDF/board/m3、`firmware init done`、`wlan mode 0`、`unified ready` | 照搬路线 |
-| 接口 | **`en0` 建起来、`configd` 自配、`ath11k returned 0`** | 照搬路线 |
+| 1 | 把开放网络那次加入的日志补上（`apple80211: a join was asked for … AN OPEN NETWORK`） | `runs/` 里有一轮含该行且随后 `NETWORK IS JOINED` |
+| 2 | 主线默认载荷指向参考内核：`main` 现在合并了脚本，但默认构建仍是自研驱动 | `boot-one.sh` 不加分支参数就能起 ath11k 版本，或 README 明确"要用 `ubuntu/ref-wifi-*.sh`" |
+| 3 | 校园网门户（Portal/CAPTCHA）在 Safari 里能完成认证 | `SDP-WeNet` 关联后打开门户页并登录成功 |
 
-**没通的**：扫描。iOS 只在 Wi-Fi 面板打开时才让 `wifid` 扫，而"自动打开面板"的七轮尝试全部失败，
-根因是**参考内核上我们的用户态定时器不可靠**（`sleep` 偶发不醒、`dispatch_after` 从不执行）。
-详细七轮记录见 `docs/WIFI-REFERENCE-PORT.md` §5.3。
+**已知的坑（写进文档以免重踩）**：
 
-**三条可选的路（按性价比）**：
-
-| 路 | 做法 | 代价 | 能证明什么 |
-|---|---|---|---|
-| **A** | 把 SSID/密码写进镜像 `fw/network`（参考实现的 `lx_os_network`），驱动开机自己连 | 需要你的网络凭据；**不需要任何延时/UI** | 端到端能不能上网（最有说服力） |
-| **B** | 查内核的用户态定时器（我们进程 `sleep` 不醒，iOS 自己的正常） | 几轮实验 | 修好后 UI 自动化、以及其他延时逻辑全通 |
-| **C** | 人在手机边时手动点一次 Settings → Wi-Fi | 一分钟 | 只证明"能扫到" |
-
-**红线不变**：任何一步碰 `0x60000000` / `0x60100000` 前先确认链路已训练；一次只改一步；
-PHY 的 ready 极性是 `bit6=1` 为**已就绪**。
+- `wifi_join=1` 是内核自己连（射频不给 iOS，开关灰掉）；要 iOS 管开关必须 `wifi_station=1`。
+- 这套内核里用户态定时器不可靠（同一进程第 7 次等待永久挂起），任何"等 N 秒再点"的自动化都不成立。
+- 参考实现只放行 WPA2 与开放网络；WPA3/企业网仍是 `ENOTSUP`。
 
 ### P1 ramfs 名字查找 bug（2 天，但可能很关键）
 
@@ -168,7 +166,8 @@ PHY 的 ready 极性是 `bit6=1` 为**已就绪**。
 | **M2.5 无线电起来** | `en0` 存在、`ath11k returned 0`、station 交给 iOS | ✅ 11-04（照搬路线，§13.18） |
 | **M3 扫到 SSID** | Settings → Wi-Fi 列出真实热点 | ✅ 11-04 15:1x（14 个热点，§5.4） |
 | **M3.5 WPA2 关联** | `ASSOCIATION … station number 2`、`THE NETWORK IS JOINED` | ✅ 11-04 15:1x |
-| **M4 真的联网** | 关联 → DHCP → Safari 打开页面 | 只差 DHCP（`networkd_privileged` 未在 job 列表） |
+| **M3.6 开放网络** | 无密码网络可加入（`HAKIOS_STA_OPEN` 放行） | ✅ 11-04 16:0x（用户真机；日志待补） |
+| **M4 网页** | Safari 用 https 打开页面 | ✅ 11-04 15:5x（`trustd` 补上后 `bing.com` 带锁） |
 | **M5 观感补齐** | 默认壁纸 + 图标布局跨重启保留 | 与 M2 并行 |
 
 ---
@@ -230,6 +229,9 @@ python tools/logdump.py head 8388608   # 查存档头 RDWVAR
 
 - **2026-11-03 16:10**：初版。存储显示（`3c3df45`）与持久化（`9c7b712`）已关；主线收敛到
   Wi-Fi 链路；本周先交付中文语言；新增 P1「ramfs 名字查找 bug」。
+- **2026-11-04 16:10**：**Wi-Fi 通了。** `wifi-ref-port` 快进并入 `main`（§13.19）。开放网络真正的
+  拒绝点是 `station_join()` 第一行（不是 `protection()`）；浏览器的"打不开"是 `trustd` 没启动、
+  与 DNS/DHCP 无关。里程碑 M3/M3.5/M3.6/M4 全部打勾；P0-2 转入收尾（补日志、接主线构建、门户认证）。
 - **2026-11-04 15:00**：Wi-Fi 这一层重估。链路（`24f4d4a`）与照搬参考实现（§13.18）都有真机证据：
   固件搬到 AMSS、`en0` 起来、`ath11k returned 0`；扫描未拿到，根因是参考内核上我们的用户态定时器
   不可靠。新增 `docs/WIFI-REFERENCE-PORT.md`，P0-2 改成"三条可选的路"。

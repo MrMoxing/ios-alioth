@@ -291,6 +291,29 @@ configd 自己做了这件事（至少对 WPA2 热点）。
    不需要 DHCP，但每换一个网络就得改。
 3. **换一个带 `networkd` 的 iOS 版本/卷**（16.5 之后的卷里它可能在 System Cryptex 里），最省事但要重做镜像。
 
+### 5.3.5 开放网络真正的拒绝点：`station_join()` 的第一行（16:0x，已修）
+
+上一节改的 `protection()` 是对的，但**没有执行到**。开放网络真正的闸门在 `station_join()` 开头：
+
+```c
+if (what->security != HAKIOS_STA_WPA2_PSK) {
+    lx_tell("lx: a network without WPA2 and a passphrase is asked for: that is not built
+");
+    return (ENOTSUP);          /* ← Settings 的 "Unable to join the network" 就是这一行 */
+}
+```
+
+它在任何扫描、任何 `protection()` 之前，所以开放网络连 beacon 都没读就被 `ENOTSUP` 退回去了。
+这就是为什么四轮日志都指向 `protection()` 却始终不起作用——**看代码要看入口，不要从症状附近开始读**。
+
+修法：`HAKIOS_STA_OPEN` 一并放行，后面那条（不带 RSN 元素、不置 Privacy 位、跳过四步握手、
+`ASSOC → AUTHORIZED`）已经在上一节里写好了。
+
+真机状态：用户确认 `SDP-WeNet` 现在可以加入；**但日志窗口没有抓到那一次**
+（`runs/opengate.log.txt` 覆盖 16:00:16–16:04:42，`join` 出现 0 次；更早的四次 `NETWORK IS JOINED`
+全是 WPA2 热点）。下一轮补一条 `apple80211: a join was asked for … AN OPEN NETWORK` 的现场记录，
+这件事才算有证据闭合。
+
 ### 5.4 扫到、并且连上了（15:1x，真机，`runs/wifihand3.log.txt`）
 
 手动点开 Settings → Wi-Fi（这一步自动化做不了，原因见 §5.3），射频侧一次就到位：

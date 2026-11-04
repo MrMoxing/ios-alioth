@@ -80,7 +80,8 @@
 | `tools/loctable-langs.py` / `loctable-keys.py` | 读 `.loctable`：有哪些语言、两种语言逐键对照（语言问题的取证工具） |
 | `tools/mkp37.sh` / `mkp38.sh` | pcie=14 的载荷：BHI 只送 512 KiB SBL；p38 换成自有连续缓冲 + 回读 |
 | `ubuntu/ref-wifi-build.sh` | **照搬参考实现的 Wi-Fi**：拉 Linux/FreeBSD 源码、编 `ath11k.o`、内核链进去 |
-| `ubuntu/ref-wifi-payload.sh` | 用参考内核 + 我们的镜像打载荷（`SCENE=` 选场景；含 `QCA=1` 的固件名映射） |
+| `ubuntu/ref-wifi-payload.sh` | 用参考内核 + 我们的镜像打载荷（`SCENE=` 选场景、`JOIN=1` 内核自连、`LRA=` 运行秒数；含 `QCA=1` 的固件名映射） |
+| `ubuntu/ref-open-network.patch` | 相对 `hakios-k40-r45.patch` 之后的增量：开放网络加入、`fw/network`、join 现场打印（611 行） |
 | `~/k40/tools/gpu-test/` | **GPU 判据测试**：`test_gpu.c`（用户态直测）、`test_tables.py`（校验 SoC 表）、`run.sh` |
 | `~/k40/tools/check-constants.py` | 源码常量 vs 设备树/ABL 表的一致性检查 |
 | `~/k40/tools/apfs/` | APFS 读取器（`apfs.py`、`apfs-tool`），与内核实现交叉验证 |

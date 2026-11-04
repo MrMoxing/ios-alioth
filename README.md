@@ -37,7 +37,7 @@ fastboot boot → Mu-Silicium UEFI → xnuloader (EFI 应用) → XNU → launch
 | EPSS 三簇调频 1804 / 2419 / 3187 MHz | `docs/evidence/2026-10-22-first-boot-kernel.log` |
 | 数据卷跨启动持久化（`var_store`，2×2 GiB） | `com.redwood.varstore` job；`kern.redwood.ufs_write_bytes` |
 
-**仍未达成（勿期待）**：Wi-Fi 的**上网**（链路、扫描、WPA2 关联已通，还差 DHCP 拿地址，见 §6 表）、
+**仍未达成（勿期待）**：校园网的**门户认证**（关联已通，Portal/CAPTCHA 未在 Safari 里走过，见 §6 表）、
 真实音频（`mediaserverd` 未启动）、相机、蜂窝/蓝牙；
 **真熄屏**（电源键目前是画黑帧，面板仍通电——AMOLED 需 DSI 命令，见 §6）；系统默认壁纸
 （iOS 16 的壁纸由 PosterBoard 程序化渲染，见 §6）；系统语言（默认仍英文，
@@ -389,7 +389,7 @@ GitHub 仓库不含 `firmware/` 与 `boot/system.apfs`（见 §3.1 / §7），�
 | 真熄屏 | **假息屏**：电源键后画黑帧，面板仍通电（AMOLED 无背光，亮度走 DCS；K40 面板 k11a 的 WLED 驱动未绑定可证）。XNU 无 DSI 驱动，面板由 UEFI DisplayDxe（闭源 .efi）初始化 | 需在 XNU 实现 MDSS DSI 命令模式 + DCS 0x28/0x10，是多会话工程 |
 | 默认壁纸 | iOS 16.5 的壁纸是 PosterBoard 程序化渲染，镜像与固件里**没有位图**；壁纸进程从未运行过，材质回落洋红 | 让 PosterBoard 跑起来并产出 wallpaper store；或注入层给 PaperBoardUI 喂真实图片（`inject_sb.c` 已有挂点说明） |
 | 存储 | **已通**：根卷报 darwin 的 20 GiB、可用 12.2 GiB（`runs/df10.log.txt`），About/设置不再显示 "0 可用"；**`/private/var` 跨重启保留**（写窗口在 logdump 的 8–64 MB，两槽 28 MiB 轮换，见 §13.15） | 数据卷仍是 RAM，持久化靠一份约 24 MB 的打包副本：prefs、keychain、容器元数据、图标布局能留住，装 App 和存照片不能 |
-| Wi-Fi（QCA6390 PCIe0） | **面板可打开**（2026-11-01：补 configd/securityd/wifianalyticsd）；**链路已通**（2026-11-03，`24f4d4a`：LTSSM L0、端点 `17cb:1101`，三个死因见 §13.17）；**无线电也已起来**（2026-11-04，分支 `wifi-ref-port`：整套照搬参考实现——Linux 的 ath11k 编进 XNU——BHI 512 KiB SBL → MHI M0 → BHIE 4.3 MB AMSS → QMI 下 BDF/board/m3 → **`en0` 存在、`ath11k returned 0`**，见 §13.18）；**扫描与 WPA2 连接已通**（2026-11-04 15:1x 真机：扫到 14 个热点，`AUTHENTICATION status 0`、`ASSOCIATION … station number 2`、`THE NETWORK IS JOINED: frames can pass`，截图 `docs/evidence/2026-11-04-wifi-joined.png`）；**还差 IP**：`networkd_privileged` 不在 job 列表里，DHCP 没跑 | 把 `com.apple.networkd_privileged` 加进 daemon 列表，让 `en0` 拿到 DHCP 地址 |
+| Wi-Fi（QCA6390 PCIe0） | ✅ **通了**（2026-11-04，已并入 `main`）：面板可开（configd/securityd/wifianalyticsd）→ 链路 L0（`24f4d4a`：LTSSM 0x111、端点 `17cb:1101`）→ 整套照搬参考实现（Linux 的 ath11k 编进 XNU）：BHI 512 KiB SBL → MHI M0 → BHIE 4.3 MB AMSS → QMI 下 BDF/board/m3 → **`en0`、`ath11k returned 0`** → **扫到 14 个热点** → **WPA2 关联四步握手完成** → **开放网络（无密码）可加入** → 补上 `trustd`/`mDNSResponder` 后 **Safari 用 https 打开 `bing.com`（带锁）**。详见 `docs/SESSION-HANDOFF.md` §13.17–13.19 与 `docs/WIFI-REFERENCE-PORT.md` | 校园网 Portal 认证、自动重连与长时间稳定性未测；WPA3/企业网仍是 `ENOTSUP` |
 | 音频 | `mediaserverd` 未启动，音量条电平由 userland 维持 | — |
 | CPU | 只有 4 核 online（A55 未起） | — |
 

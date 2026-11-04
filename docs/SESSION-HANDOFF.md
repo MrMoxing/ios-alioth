@@ -1434,3 +1434,51 @@ p24 量到 PHY ready（status `0xa6`，pipe clock 62.4 MHz）→ p25 的第 11 �
 
 **开机参数**（参考实现自己的开关，`hakios_wifi_option` 读它们）：
 `pcie_step=31 pcie_at=2 pcie_ipcr=2 wifi_lx=2 wifi_quiet=1 wifi_station=1 wifi_keep=1 wifi=1 wifi_mac=<本机>`
+
+### 13.19 Wi-Fi 打通：扫描、WPA2、开放网络、浏览器 HTTPS（11-04 12:4x–16:0x，已并入 main）
+
+**一句话**：`wifi-ref-port` 分支快进合并进 `main`（14 个提交）。至此这条链的每一段都有真机证据：
+链路 L0 → 固件到 AMSS → `ath11k returned 0` → **扫到 14 个热点** → **WPA2 关联、四步握手、
+`THE NETWORK IS JOINED`** → **Safari 用 https 打开 `bing.com`**（地址栏带锁）。开放网络（无密码）
+由用户真机确认可以加入，日志待补（见下）。
+
+**路线决定**：整包采用参考实现（Linux 7.0.14 的 ath11k 编进 XNU），而不是把四条补进我们自己的
+`alioth_pcie.c`。理由是真机证据：参考实现在我们的 loader + 我们的 iOS 镜像上，一次就走到 `en0`；
+我们自己的驱动还差 SMMU 页表、BHIE 分段、QRTR/QMI、802.11 状态机四整块。
+
+| 段 | 证据（真机） |
+|---|---|
+| 链路 | `parf_ltssm 0x111`（L0）、端点 `17cb:1101` |
+| 固件 | BHI 512 KiB SBL → MHI M0 → BHIE 4,352,144 B AMSS（9 段）→ `unified ready` |
+| 协议栈 | QMI 下 BDF/board/m3 → 射频注册、CN 监管域 → `ath11k returned 0` |
+| 接口 | `en0 is there`、`configd has a network service for en0` |
+| 扫描 | `THE SCAN HEARD 14 NETWORKS … 最强 -16 dBm`，Settings 列出 `SDP-WeNet`、`OnePlusAce 6`、`h#hMagic8 Pro` |
+| WPA2 | `AUTHENTICATION status 0` → `ASSOCIATION … station number 2` → `THE KEYS ARE GIVEN TO THE DRIVER, 33 ms` → `THE NETWORK IS JOINED: frames can pass` |
+| 开放网络 | `protection()` 与 `station_join()` 两处放行（`HAKIOS_STA_OPEN`）；用户确认可加入，日志待补 |
+| 网页 | `trustd` + `mDNSResponder` 进 job 列表后，Safari 打开 `bing.com`（锁标识，页面完整渲染） |
+
+**三个关键发现**（都不是"再改一个寄存器"）：
+
+1. **开放网络被两处代码拒绝，第一处才是真的**：`protection()` 说"an open network is not joined by
+   this"，但真正拦住的是 `station_join()` **第一行**的 `security != HAKIOS_STA_WPA2_PSK`。它在任何
+   扫描之前，所以只改 `protection()` 四轮都无效。教训：从入口读代码，不要从报症状的地方往外改。
+2. **浏览器"打不开"不是 DNS 也不是 DHCP**：日志里 76 次
+   `failed lookup: name = com.apple.trustd, requestor = com.apple.WebKit`——判证书的守护进程没启动，
+   WebKit 得到"没人评判"就显示 "This Connection Is Not Private"。`trustd` 与 `mDNSResponder`
+   两个程序和 plist 都在镜像里，只是从没进过 job 列表。
+3. **`wifi_join=1` 与 `wifi_station=1` 是两条不同的世界**：前者把射频留在内核手里（Settings 的开关
+   灰掉、打不开），后者交给 iOS。用错会以为"Wi-Fi 彻底坏了"。
+
+**留下的缺口（按优先级）**：
+
+| 缺口 | 现状 |
+|---|---|
+| 开放网络那次加入没有日志 | 用户确认成功；`runs/opengate.log.txt` 窗口内 `join` 为 0，需补一轮现场记录 |
+| 主线默认载荷仍是我们自己的 `alioth_pcie.c` | `main` 合并了脚本与补丁，但默认构建不出 ath11k 内核；要用 `ubuntu/ref-wifi-build.sh` |
+| 校园网门户认证 | 关联已通；`SDP-WeNet` 有 Portal/CAPTCHA，需要浏览器里的门户页可用（HTTPS 已通，未试） |
+| 自动重连 / 稳定性 | 未测；每次开机靠已存网络自动加入热点 |
+| 中文语言（P0-1） | 仍卡在 bundle 是否被判为"有中文"，与 Wi-Fi 无关 |
+
+**新增文件**：`ubuntu/ref-wifi-build.sh`（拉 Linux/FreeBSD 源码、编 `ath11k.o` 764,492 B、
+链进内核 15,722,736 B）、`ubuntu/ref-wifi-payload.sh`（`JOIN=`/`LRA=` 可调）、
+`ubuntu/ref-open-network.patch`（611 行，相对上游 `hakios-k40-r45.patch` 之后的状态）。
