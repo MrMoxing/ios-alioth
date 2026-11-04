@@ -133,6 +133,16 @@ IOS_JOBS=${JOBS-"
 # (Count a QEMU run log with its duplicate lines removed: run-ios.sh prints launchd's log twice.)
 # WIFID=0 leaves it out.
 [ "${WIFID-1}" != 0 ] && IOS_JOBS="$IOS_JOBS com.apple.wifid"
+# com.apple.mDNSResponder is the resolver: every name that is not a literal address is asked of it,
+# and with nothing answering Safari's answer to any page is "the server cannot be found".
+# com.apple.trustd is what judges a TLS certificate: WebKit asks it, and with nothing answering the
+# answer it gets back is "not trusted", which Safari shows as "This Connection Is Not Private"
+# (76 failed lookups of it in one session, and not one page that loaded).
+# Both programs and their job definitions are in the image; neither had ever been in this list, so a
+# joined network looked like no network at all. Measured on the phone 2026-11-04: with them in,
+# Safari opens an https page with its padlock.
+[ "${MDNS-1}" != 0 ] && IOS_JOBS="$IOS_JOBS com.apple.mDNSResponder"
+[ "${TRUSTD-1}" != 0 ] && IOS_JOBS="$IOS_JOBS com.apple.trustd"
 # The programs (file names) started with a library of ours inside them: "LIBRARY NAME..." per line
 # (src/inject.c is libredwood.dylib, src/inject_sb.c is libredwood-sb.dylib, src/inject_media.c is
 # libredwood-media.dylib).

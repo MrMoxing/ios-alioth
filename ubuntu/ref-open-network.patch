@@ -1,0 +1,611 @@
+diff --git a/wifi/lx/src/lx_80211.c b/wifi/lx/src/lx_80211.c
+index 32bde30..714c863 100644
+--- a/wifi/lx/src/lx_80211.c
++++ b/wifi/lx/src/lx_80211.c
+@@ -82,6 +82,7 @@ struct lx_radio {
+ 	struct ieee80211_vif *vif;		/* the one interface, while it is up */
+ 	void *vif_memory;
+ 	bool started;
++	uint16_t management_sequence;	/* Sequence Control, shared by management types; survives leave/join */
+ 
+ 	/* a scan */
+ 	volatile int scan;			/* 0: none, 1: running, 2: over, 3: given up by the driver */
+@@ -480,9 +481,22 @@ linuxkpi_ieee80211_handle_wake_tx_queue(struct ieee80211_hw *hw, struct ieee8021
+ {
+ }
+ 
++/* Only management type/status/length: no peer addresses, network names or frame bytes. */
++static void
++management_tx_trace(struct sk_buff *skb, const char *how, int status)
++{
++	if (!lx_os_option("wifi_mgmt_trace") || skb->len < 24 || (skb->data[0] & 0x0c) != 0 ||
++	    (IEEE80211_SKB_CB(skb)->flags & IEEE80211_TX_CTL_HW_80211_ENCAP)) {
++		return;
++	}
++	lx_tell("lx: management %s type %#x length %u ack %u status %d\n", how, skb->data[0] & 0xfc, skb->len,
++	    (IEEE80211_SKB_CB(skb)->flags & IEEE80211_TX_STAT_ACK) != 0, status);
++}
++
+ void
+ linuxkpi_ieee80211_tx_status(struct ieee80211_hw *hw, struct sk_buff *skb)
+ {
++	management_tx_trace(skb, "complete", 0);
+ 	dev_kfree_skb_any(skb);
+ }
+ 
+@@ -490,13 +504,14 @@ void
+ linuxkpi_ieee80211_tx_status_ext(struct ieee80211_hw *hw, struct ieee80211_tx_status *status)
+ {
+ 	if (status->skb != NULL) {
+-		dev_kfree_skb_any(status->skb);
++		linuxkpi_ieee80211_tx_status(hw, status->skb);
+ 	}
+ }
+ 
+ void
+ linuxkpi_ieee80211_free_txskb(struct ieee80211_hw *hw, struct sk_buff *skb, int status)
+ {
++	management_tx_trace(skb, "drop", status);
+ 	dev_kfree_skb_any(skb);
+ }
+ 
+@@ -548,6 +563,37 @@ static const uint8_t wmm[4] = { 0x00, 0x50, 0xf2, 0x02 };	/* Microsoft's, which
+ 
+ /* ---- what the radio hears -------------------------------------------------------------------------- */
+ 
++/* RX metadata can describe a neighbouring channel. DS or HT operation gives the BSS primary.
++ * This is the cfg80211 channel-selection rule, implemented with this shim's existing IE parser.
++ * Never turn an invalid or disabled advertised primary into permission to transmit elsewhere.
++ */
++static struct linuxkpi_ieee80211_channel *
++beacon_channel(struct wiphy *wiphy, const uint8_t *elements, unsigned length, unsigned received)
++{
++	struct linuxkpi_ieee80211_channel *channel = linuxkpi_ieee80211_get_channel(wiphy, received);
++	const uint8_t *operation;
++	unsigned primary;
++
++	if (channel == NULL) {
++		return (NULL);
++	}
++	if (channel->band == NL80211_BAND_2GHZ || channel->band == NL80211_BAND_5GHZ) {
++		operation = element(elements, length, 3);
++		if (operation != NULL && operation[1] == 1) {
++			primary = operation[2];
++		} else {
++			operation = element(elements, length, 61);
++			if (operation == NULL || operation[1] < 22) {
++				return ((channel->flags & IEEE80211_CHAN_DISABLED) ? NULL : channel);
++			}
++			primary = operation[2];
++		}
++		channel = linuxkpi_ieee80211_get_channel(wiphy,
++		    linuxkpi_ieee80211_channel_to_frequency(primary, channel->band));
++	}
++	return (channel != NULL && !(channel->flags & IEEE80211_CHAN_DISABLED) ? channel : NULL);
++}
++
+ /*
+  * A beacon or an answer to a probe (IEEE 802.11-2020, 9.3.3): after the 24 bytes every
+  * management frame begins with -- the sender's network is the third address -- a time stamp, the
+@@ -560,7 +606,16 @@ heard(struct lx_radio *radio, const uint8_t *frame, unsigned length, unsigned fr
+ {
+ 	struct lx_heard *network = NULL;
+ 	const uint8_t *elements = frame + 36, *name = element(elements, length - 36, 0);
++	struct linuxkpi_ieee80211_channel *primary = beacon_channel(radio->wiphy, elements, length - 36, frequency);
+ 
++	if (primary == NULL) {
++		return;
++	}
++	if (lx_os_option("wifi_mgmt_trace") && frequency != primary->center_freq && name != NULL &&
++	    radio->want_length != 0 && name[1] == radio->want_length && memcmp(name + 2, radio->want, name[1]) == 0) {
++		lx_tell("lx: beacon primary corrected from %u to %u MHz\n", frequency, primary->center_freq);
++	}
++	frequency = primary->center_freq;
+ 	lx_os_lock();
+ 	if (name != NULL && radio->want_length != 0 && name[1] == radio->want_length &&
+ 	    memcmp(name + 2, radio->want, radio->want_length) == 0 && (!radio->target.found || signal > radio->target.signal) &&
+@@ -676,7 +731,7 @@ say_heard(struct lx_radio *radio)
+ 			snprintf(line + strlen(line), sizeof(line) - strlen(line), " %u on %u,", on_channel[channel], channel);
+ 		}
+ 	}
+-	printf("lx: THE SCAN HEARD %u NETWORKS (access points): %u at 2.4 GHz, %u at 5 GHz; by channel:%s the strongest at %d dBm, "
++	lx_tell("lx: THE SCAN HEARD %u NETWORKS (access points): %u at 2.4 GHz, %u at 5 GHz; by channel:%s the strongest at %d dBm, "
+ 	    "the weakest at %d; %u open, %u without a name; %u frames in all, %u of them neither beacon nor answer to a probe%s\n",
+ 	    radio->heard_count, low, high, line, radio->heard_count ? strongest : 0, radio->heard_count ? weakest : 0, open, nameless,
+ 	    radio->frames, radio->others, radio->heard_lost ? "; MORE WERE HEARD THAN THERE WAS ROOM FOR" : "");
+@@ -708,6 +763,7 @@ frame_send(struct lx_radio *radio, struct sk_buff *skb)
+ {
+ 	struct ieee80211_tx_control control = { .sta = radio->sta };
+ 
++	management_tx_trace(skb, "submit", 0);
+ 	radio->ops->tx(&radio->hw, &control, skb);
+ }
+ 
+@@ -715,7 +771,16 @@ frame_send(struct lx_radio *radio, struct sk_buff *skb)
+ static uint8_t *
+ management(struct lx_radio *radio, uint8_t *frame, unsigned kind)
+ {
++	uint16_t sequence;
++
++	/* The ath11k WMI management path sends this header unchanged. Fragment number stays zero. */
++	lx_os_lock();
++	sequence = radio->management_sequence;
++	radio->management_sequence = (uint16_t)((sequence + 0x10u) & 0xfff0u);
++	lx_os_unlock();
+ 	bzero(frame, 24);
++	frame[22] = (uint8_t)sequence;
++	frame[23] = (uint8_t)(sequence >> 8);
+ 	frame[0] = (uint8_t)kind;
+ 	memcpy(frame + 4, radio->target.address, ETH_ALEN);
+ 	memcpy(frame + 10, radio->vif->addr, ETH_ALEN);
+@@ -832,6 +897,12 @@ management_received(struct lx_radio *radio, const uint8_t *f, unsigned length)
+ 	int answer = ANSWER_NONE;
+ 	unsigned status = 0;
+ 
++	if (lx_os_option("wifi_mgmt_trace") && length >= 24 &&
++	    (f[0] == 0xb0 || f[0] == 0x10 || f[0] == 0xa0 || f[0] == 0xc0)) {
++		lx_tell("lx: management receive type %#x length %u own %u peer %u station %u\n", f[0], length,
++		    radio->vif != NULL && memcmp(f + 4, radio->vif->addr, ETH_ALEN) == 0,
++		    memcmp(f + 10, radio->target.address, ETH_ALEN) == 0, radio->sta != NULL);
++	}
+ 	if (radio->sta == NULL || length < 26 || memcmp(f + 10, radio->target.address, ETH_ALEN) != 0 ||
+ 	    memcmp(f + 4, radio->vif->addr, ETH_ALEN) != 0) {
+ 		return;
+@@ -1048,7 +1119,7 @@ station_scan(struct lx_radio *radio, const uint8_t *name, unsigned name_length,
+ 	mutex_lock(&hw->wiphy->mtx);
+ 	ret = radio->ops->hw_scan(hw, radio->vif, request);
+ 	mutex_unlock(&hw->wiphy->mtx);
+-	printf("lx: THE DRIVER IS ASKED TO SCAN %d channels, %s: %d\n", request->req.n_channels, quiet ? "listening only" :
++	lx_tell("lx: THE DRIVER IS ASKED TO SCAN %d channels, %s: %d\n", request->req.n_channels, quiet ? "listening only" :
+ 	    name_length != 0 ? "asking for one network by name where it may send" : "asking for any network where it may send", ret);
+ 	if (ret == 0) {
+ 		lx_os_lock();
+@@ -1056,7 +1127,7 @@ station_scan(struct lx_radio *radio, const uint8_t *name, unsigned name_length,
+ 			lx_os_sleep(&radio->scan, 100 * 1000000ull);
+ 		}
+ 		lx_os_unlock();
+-		printf("lx: %llu ms later the scan is %s\n", (lx_os_nanoseconds() - began) / 1000000ull, radio->scan == 2 ? "OVER" :
++		lx_tell("lx: %llu ms later the scan is %s\n", (lx_os_nanoseconds() - began) / 1000000ull, radio->scan == 2 ? "OVER" :
+ 		    radio->scan == 3 ? "GIVEN UP by the driver" : "NOT OVER: the driver has not said so");
+ 		say_heard(radio);
+ 		if (radio->scan == 1 && radio->ops->cancel_hw_scan != NULL) {
+@@ -1289,12 +1360,14 @@ request_elements(struct lx_radio *radio, uint8_t *out, unsigned group_cipher)
+ 		*at++ = (uint8_t)channel_of(channel->center_freq);
+ 		*at++ = 1;
+ 	}
+-	radio->rsn[0] = 48;
+-	radio->rsn[1] = 20;
+-	memcpy(radio->rsn + 2, "\x01\x00\x00\x0f\xac\x04\x01\x00\x00\x0f\xac\x04\x01\x00\x00\x0f\xac\x02\x00\x00", 20);
+-	radio->rsn[7] = (uint8_t)group_cipher;
+-	memcpy(at, radio->rsn, 22);
+-	at += 22;
++	if (group_cipher != 0) {		/* an open network asks for nothing, and says so by saying nothing */
++		radio->rsn[0] = 48;
++		radio->rsn[1] = 20;
++		memcpy(radio->rsn + 2, "\x01\x00\x00\x0f\xac\x04\x01\x00\x00\x0f\xac\x04\x01\x00\x00\x0f\xac\x02\x00\x00", 20);
++		radio->rsn[7] = (uint8_t)group_cipher;
++		memcpy(at, radio->rsn, 22);
++		at += 22;
++	}
+ 	if (element(target->elements, target->elements_length, 45) != NULL && band->ht_cap.ht_supported) {
+ 		uint16_t cap = (uint16_t)(band->ht_cap.cap & (radio->width > 20 ? 0xffff : ~(IEEE80211_HT_CAP_SUP_WIDTH_20_40 |
+ 		    IEEE80211_HT_CAP_SGI_40)));
+@@ -1339,8 +1412,18 @@ protection(const struct lx_target *target, unsigned *group_cipher)
+ 	unsigned count;
+ 
+ 	if (rsn == NULL) {
+-		return (target->capability & 0x10 ? "it is protected by something older than WPA2" : "it is not protected at all: an "
+-		       "open network is not joined by this");
++		/*
++		 * No RSN element at all: an open network -- the campus ones here are of this kind (a name,
++		 * no passphrase, a portal that asks later). There is nothing to agree on and nothing to
++		 * cipher, so there is no key and no four-way handshake; *group_cipher = 0 says so to the
++		 * rest of this path. Refusing these was what made "Unable to join the network" the only
++		 * answer Settings could give.
++		 */
++		if (target->capability & 0x10) {
++			return ("it says its frames are protected but offers no RSN element (WEP, which is not done here)");
++		}
++		*group_cipher = 0;
++		return (NULL);
+ 	}
+ 	at = rsn + 2;
+ 	end = at + rsn[1];
+@@ -1586,8 +1669,14 @@ station_join(struct lx_radio *radio, const struct hakios_sta_join *what)
+ 	if (name_length == 0 || name_length > sizeof(radio->want)) {
+ 		return (EINVAL);
+ 	}
+-	if (what->security != HAKIOS_STA_WPA2_PSK) {
+-		lx_tell("lx: a network without WPA2 and a passphrase is asked for: that is not built\n");
++	/*
++	 * An open network is a network: it is asked for with no passphrase, and the path below joins it
++	 * without a key (protection() says *group_cipher = 0, the association request carries no RSN
++	 * element, and the four-way handshake is skipped). This check used to refuse it here, at the top
++	 * of the function, which is what Settings showed as "Unable to join the network".
++	 */
++	if (what->security != HAKIOS_STA_WPA2_PSK && what->security != HAKIOS_STA_OPEN) {
++		lx_tell("lx: a network of neither the WPA2 nor the open kind is asked for: that is not built\n");
+ 		return (ENOTSUP);
+ 	}
+ 	if (radio->sta != NULL) {
+@@ -1630,19 +1719,19 @@ station_join(struct lx_radio *radio, const struct hakios_sta_join *what)
+ 		lx_tell("lx: THE NETWORK THAT IS WANTED WAS NOT HEARD (a name of %u bytes), in three scans\n", name_length);
+ 		return (ENOENT);
+ 	}
+-	channel = linuxkpi_ieee80211_get_channel(hw->wiphy, target->frequency);
+-	if ((e = element(target->elements, target->elements_length, 3)) != NULL && e[1] == 1 && channel != NULL &&
+-	    linuxkpi_ieee80211_get_channel(hw->wiphy, linuxkpi_ieee80211_channel_to_frequency(e[2], channel->band)) != NULL) {
+-		/* (a beacon can be heard on the channel next to its own: where it says it is counts) */
+-		channel = linuxkpi_ieee80211_get_channel(hw->wiphy, linuxkpi_ieee80211_channel_to_frequency(e[2], channel->band));
++	channel = beacon_channel(hw->wiphy, target->elements, target->elements_length, target->frequency);
++	if (lx_os_option("wifi_mgmt_trace") && channel != NULL) {
++		lx_tell("lx: management channel frequency %u flags %#x original %#x max_power %d\n",
++		    channel->center_freq, channel->flags, channel->orig_flags, channel->max_power);
+ 	}
+ 	obstacle = protection(target, &group_cipher);
+ 	lx_tell("lx: the network that is wanted: an access point on channel %u (%u MHz) at %d dBm, capabilities %#x, beacons every "
+ 	    "%u units; HT %s, VHT %s, WMM %s; %s%s\n", channel != NULL ? channel_of(channel->center_freq) : 0, channel != NULL ?
+ 	    channel->center_freq : 0, target->signal, target->capability, target->interval, element(target->elements,
+ 	    target->elements_length, 45) ? "yes" : "no", element(target->elements, target->elements_length, 191) ? "yes" : "no",
+-	    vendor_element(target->elements, target->elements_length, wmm) ? "yes" : "no", obstacle == NULL ? "WPA2 with a "
+-	    "passphrase and CCMP: it can be joined" : "IT CANNOT BE JOINED: ", obstacle == NULL ? "" : obstacle);
++	    vendor_element(target->elements, target->elements_length, wmm) ? "yes" : "no", obstacle != NULL ? "IT CANNOT BE "
++	    "JOINED: " : group_cipher != 0 ? "WPA2 with a passphrase and CCMP: it can be joined" : "an OPEN network (no RSN "
++	    "element): it can be joined as it is", obstacle == NULL ? "" : obstacle);
+ 	if (obstacle != NULL || channel == NULL || (channel->flags & IEEE80211_CHAN_DISABLED)) {
+ 		return (ENOTSUP);
+ 	}
+@@ -1650,19 +1739,27 @@ station_join(struct lx_radio *radio, const struct hakios_sta_join *what)
+ 	/* the key of the name and the passphrase, and what the handshake needs besides */
+ 	began = lx_os_nanoseconds();
+ 	bzero(&radio->wpa, sizeof(radio->wpa));
+-	if (what->passphrase_length != 0) {
+-		lx_wpa_pmk(what->passphrase, what->passphrase_length, name, name_length, radio->wpa.pmk);
++	if (group_cipher != 0) {
++		if (what->passphrase_length != 0) {
++			lx_wpa_pmk(what->passphrase, what->passphrase_length, name, name_length, radio->wpa.pmk);
++		} else {
++			memcpy(radio->wpa.pmk, what->pmk, sizeof(radio->wpa.pmk));
++		}
++		radio->wpa.rsn = radio->rsn;
++		radio->wpa.rsn_length = 22;
++		printf("lx: the key of the name (%u bytes) and the passphrase (%u bytes; 0: the key itself was given) is there: "
++		    "%llu ms\n", name_length, what->passphrase_length, (lx_os_nanoseconds() - began) / 1000000ull);
+ 	} else {
+-		memcpy(radio->wpa.pmk, what->pmk, sizeof(radio->wpa.pmk));
++		/* an open network: the handshake is never begun, and its state must not look as if it had been */
++		radio->wpa.rsn = NULL;
++		radio->wpa.rsn_length = 0;
++		lx_tell("lx: %u bytes of a name and no passphrase: an open network, so there is no key of the name to compute\n",
++		    name_length);
+ 	}
+ 	memcpy(radio->wpa.own, vif->addr, ETH_ALEN);
+ 	memcpy(radio->wpa.peer, target->address, ETH_ALEN);
+ 	get_random_bytes(radio->wpa.own_nonce, sizeof(radio->wpa.own_nonce));
+-	radio->wpa.rsn = radio->rsn;
+-	radio->wpa.rsn_length = 22;
+ 	radio->handshake = LX_WPA_NOTHING;
+-	printf("lx: the key of the name (%u bytes) and the passphrase (%u bytes; 0: the key itself was given) is there: %llu ms\n",
+-	    name_length, what->passphrase_length, (lx_os_nanoseconds() - began) / 1000000ull);
+ 
+ 	/* the access point's address, and its channel, 20 MHz wide */
+ 	vif->bss_conf.bssid = target->address;
+@@ -1743,7 +1840,7 @@ station_join(struct lx_radio *radio, const struct hakios_sta_join *what)
+ 		}
+ 		frame = management(radio, frame, 0x00);
+ 		/* capabilities: an infrastructure network, protected, and of the access point's own what a station repeats */
+-		frame[0] = (uint8_t)(0x01 | 0x10 | (target->capability & 0x20));
++		frame[0] = (uint8_t)(0x01 | (group_cipher != 0 ? 0x10 : 0) | (target->capability & 0x20));
+ 		frame[1] = (uint8_t)((target->capability & 0x0500) >> 8);
+ 		frame[2] = 10;				/* we listen at least every tenth beacon */
+ 		frame[3] = 0;
+@@ -1789,6 +1886,19 @@ station_join(struct lx_radio *radio, const struct hakios_sta_join *what)
+ 	    radio->sta->deflink.supp_rates[channel->band], radio->sta->deflink.ht_cap.ht_supported ? "yes" : "no",
+ 	    radio->sta->deflink.vht_cap.vht_supported ? "yes" : "no", radio->sta->deflink.rx_nss);
+ 
++	if (group_cipher == 0) {
++		/*
++		 * An open network: there is no four-way handshake to wait eight seconds for and no key to
++		 * give the driver. The ASSOC-to-AUTHORIZED transition is the last thing the driver is told,
++		 * and it is what makes the firmware pass frames.
++		 */
++		lx_tell("lx: AN OPEN NETWORK: there is no handshake to wait for and no key to give the driver\n");
++		if ((ret = station_state(radio, IEEE80211_STA_ASSOC, IEEE80211_STA_AUTHORIZED)) != 0) {
++			error = -ret;
++			goto out;
++		}
++		goto joined;
++	}
+ 	/* the handshake: the access point begins it; its messages come in as frames and are answered where they come in */
+ 	began = lx_os_nanoseconds();
+ 	lx_os_lock();
+@@ -1818,6 +1928,7 @@ station_join(struct lx_radio *radio, const struct hakios_sta_join *what)
+ 		error = -ret;
+ 		goto out;
+ 	}
++joined:
+ 	radio->reached = IEEE80211_STA_AUTHORIZED;
+ 	radio->sent = radio->sent_lost = radio->received = radio->received_group = radio->rekeys = 0;
+ 	radio->joined_at = lx_os_nanoseconds();
+@@ -1852,7 +1963,8 @@ lx_station_join(void)
+ 	}
+ 	what.ssid_length = (uint8_t)name_length;
+ 	what.passphrase_length = (uint8_t)passphrase_length;
+-	what.security = HAKIOS_STA_WPA2_PSK;
++	/* a name with no passphrase is an open network, and the station is told that, not WPA2 */
++	what.security = passphrase_length != 0 ? HAKIOS_STA_WPA2_PSK : HAKIOS_STA_OPEN;
+ 	lx_os_net_attach(radio->wiphy->perm_addr);
+ 	error = station_join(radio, &what);
+ 	explicit_bzero(&what, sizeof(what));
+diff --git a/xnu/files/bsd/dev/hakios.apple80211.c b/xnu/files/bsd/dev/hakios.apple80211.c
+index e07ad55..a0e185d 100644
+--- a/xnu/files/bsd/dev/hakios.apple80211.c
++++ b/xnu/files/bsd/dev/hakios.apple80211.c
+@@ -210,6 +210,8 @@ static const char interface_name[16] = "en0";   /* (bsd/dev/hakios.net.c makes o
+ static LCK_GRP_DECLARE(apple80211_lock_group, "hakios-apple80211");
+ static LCK_MTX_DECLARE(apple80211_lock, &apple80211_lock_group);
+ static unsigned result_next;                    /* which of what the last scan heard a SCAN_RESULT request gets next */
++/* iOS location hint only. The radio continues enforcing its firmware channel/power rules. */
++static uint8_t location_country[3] = { '0', '0', 0 };
+ static uint32_t join_result;                    /* of the last join asked for: 0 while it runs, then Apple80211's number */
+ 
+ /* ---- channels ---------------------------------------------------------------------------------------- */
+@@ -250,6 +252,56 @@ give(const struct apple80211req *request, const void *data, size_t length)
+ 	       request->req_len);
+ }
+ 
++/* These describe configured metadata, even when no network is associated.
++ * COUNTRY_CODE is a location hint; accepting one does not expand firmware channel permissions.
++ */
++static int
++get_country(const struct apple80211req *request)
++{
++	uint8_t country[3];
++
++	if (request->req_len < sizeof(country)) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&apple80211_lock);
++	memcpy(country, location_country, sizeof(country));
++	lck_mtx_unlock(&apple80211_lock);
++	return give(request, country, sizeof(country));
++}
++
++static int
++set_country(const struct apple80211req *request)
++{
++	struct { uint32_t version; uint8_t country[3], padding; } hint;
++	int error;
++
++	if (request->req_len != sizeof(hint)) {
++		return EINVAL;
++	}
++	if ((error = copyin(request->req_data, &hint, sizeof(hint))) != 0) {
++		return error;
++	}
++	if (hint.version != 1 || hint.country[2] != 0 ||
++	    !((hint.country[0] >= 'A' && hint.country[0] <= 'Z' && hint.country[1] >= 'A' && hint.country[1] <= 'Z') ||
++	    (hint.country[0] == '0' && hint.country[1] == '0'))) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&apple80211_lock);
++	memcpy(location_country, hint.country, sizeof(location_country));
++	lck_mtx_unlock(&apple80211_lock);
++	return 0;
++}
++
++static int
++get_auth(const struct apple80211req *request, const struct hakios_sta_state *state)
++{
++	struct { uint32_t version, lower, upper, extended; } answer = {
++	    .version = 1, .lower = 1, .upper = state->phase == HAKIOS_STA_JOINED ? 8 : 0
++	};
++
++	return give(request, &answer, sizeof(answer));
++}
++
+ /* An access point in the form a scan's result has; the caller has said how much room for elements there is. */
+ static int
+ give_network(const struct apple80211req *request, const struct hakios_sta_bss *bss)
+@@ -374,6 +426,8 @@ get(struct apple80211req *request)
+ 		kfree_data(answer, sizeof(*answer));
+ 		return error;
+ 	}
++	case 51:                                /* location country: iOS 16.5 requests the three bytes without a version */
++		return get_country(request);
+ 	case 21:                                /* how the last join went (0: not over yet) */
+ 		lck_mtx_lock(&apple80211_lock);
+ 		request->req_val = (int32_t)join_result;
+@@ -446,14 +500,9 @@ get(struct apple80211req *request)
+ 	case 103:                               /* all of it, as a scan's result */
+ 		error = state->phase != HAKIOS_STA_JOINED ? ENXIO : give_network(request, &state->bss);
+ 		break;
+-	case 2: {                               /* how it was joined: open system, then WPA2 with a passphrase */
+-		struct {
+-			uint32_t version, lower, upper, extended;
+-		} answer = { .version = 1, .lower = 1, .upper = 8 };
+-
+-		error = state->phase != HAKIOS_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
++	case 2:                                 /* authentication metadata remains readable while disconnected */
++		error = get_auth(request, state);
+ 		break;
+-	}
+ 	default:
+ 		error = EOPNOTSUPP;
+ 		break;
+@@ -548,6 +597,14 @@ set_join(const struct apple80211req *request, char *said, size_t said_size)
+ 	what->ssid_length = (uint8_t)asked->ssid_length;
+ 	memcpy(what->ssid, asked->ssid, asked->ssid_length);
+ 	memcpy(what->bssid, asked->bssid, sizeof(what->bssid));
++	/*
++	 * Every join request that reaches the kernel says so, with the kind of protection it named:
++	 * a key of 0 bytes is an open network (Settings' "Unable to join" was here or above this line,
++	 * and this line is how the two were told apart).
++	 */
++	printf("apple80211: a join was asked for: a name of %u bytes, a key of %u bytes of kind %u, so %s\n",
++	    asked->ssid_length, asked->key_length, asked->key_cipher,
++	    asked->key_length == 0 ? "AN OPEN NETWORK" : "a protected one");
+ 	if (asked->key_length == 0) {
+ 		what->security = HAKIOS_STA_OPEN;
+ 	} else if (asked->key_cipher == CIPHER_PASSPHRASE && asked->key_length >= 8 && asked->key_length <= 63) {
+@@ -581,6 +638,8 @@ static int
+ set(const struct apple80211req *request, char *said, size_t said_size)
+ {
+ 	switch (request->req_type) {
++	case 51:
++		return set_country(request);
+ 	case 20:
+ 		return set_join(request, said, said_size);
+ 	case 22:                                /* leave the network */
+diff --git a/xnu/files/bsd/dev/hakios.radio.c b/xnu/files/bsd/dev/hakios.radio.c
+index 5cfb57c..221039b 100644
+--- a/xnu/files/bsd/dev/hakios.radio.c
++++ b/xnu/files/bsd/dev/hakios.radio.c
+@@ -18,28 +18,48 @@
+ #include <libkern/libkern.h>
+ #include <mach/mach_types.h>
+ #include <sys/systm.h>
++#include <pexpert/pexpert.h>
++extern void loader_log_putc(char);
+ 
+-#define NO_RADIO        "radio: this kernel has no Wi-Fi radio built into it (the QCA6390 is a PCIe part and is not driven yet)\n"
++static int
++radio_vsay(const char *format, va_list list)
++{
++	char line[512];
++	int length = vsnprintf(line, sizeof(line), format, list);
++	for (const char *c = line; *c; c++) loader_log_putc(*c);
++	printf("%s", line);
++	return length;
++}
+ 
+ int
+ hakios_wifi_say(const char *format, ...)
+ {
+-#pragma unused(format)
+-	return 0;
++	uint32_t quiet = 0;
++	PE_parse_boot_argn("wifi_quiet", &quiet, sizeof(quiet));
++	if (quiet) return 0;
++	va_list list;
++	va_start(list, format);
++	int length = radio_vsay(format, list);
++	va_end(list);
++	return length;
+ }
+ 
+ int
+ hakios_wifi_tell(const char *format, ...)
+ {
+-#pragma unused(format)
+-	return 0;
++	va_list list;
++	va_start(list, format);
++	int length = radio_vsay(format, list);
++	va_end(list);
++	return length;
+ }
+ 
+ uint32_t
+ hakios_wifi_option(const char *name)
+ {
+-#pragma unused(name)
+-	return 0;                               /* no boot-argument has anything to say without a radio */
++	uint32_t value = 0;
++	PE_parse_boot_argn(name, &value, sizeof(value));
++	return value;
+ }
+ 
+ bool
+@@ -74,18 +94,87 @@ hakios_wifi_radio_msi(unsigned long long *address, uint32_t *data, uint32_t *fir
+ 	return false;
+ }
+ 
++/* The same wifi_mac boundary as the original port; no device value in source. */
+ bool
+ hakios_wifi_radio_address(uint8_t *address)
+ {
+-#pragma unused(address)
+-	return false;
++	char text[32] = "";
++	uint8_t bytes[6], any = 0;
++	if (!address || !PE_parse_boot_arg_str("wifi_mac", text, sizeof(text)) || strlen(text) != 17) return false;
++	for (unsigned i = 0; i < 6; i++) {
++		unsigned value = 0;
++		for (unsigned j = 0; j < 2; j++) {
++			unsigned char c = text[i * 3 + j];
++			int digit = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 :
++			    c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
++			if (digit < 0) return false;
++			value = value * 16 + (unsigned)digit;
++		}
++		if (i < 5 && text[i * 3 + 2] != ':') return false;
++		bytes[i] = (uint8_t)value;
++		any |= bytes[i];
++	}
++	if (!any || (bytes[0] & 1)) return false;
++	memcpy(address, bytes, sizeof(bytes));
++	hakios_wifi_tell("wifi: station address supplied and validated\n");
++	return true;
+ }
+ 
++/*
++ * fw/network: the network `wifi_join=1` joins without Settings -- a name on the first line, a
++ * passphrase on the second. An empty (or absent) second line is an open network, which is what the
++ * campus ones here are: no key, and a portal that asks questions later. lx_station_join() asks
++ * lx_os_network(), which is this function.
++ *
++ * It used to answer false here: this file was written for a kernel with no radio at all, and on
++ * this phone the radio is hakios.pcie.c. The small image's files are as reachable from here as from
++ * anywhere else, so the answer is read rather than refused.
++ */
++extern const uint8_t *hakios_image_file(const char *directory, const char *name, uint64_t *size, int *disk);
++
+ bool
+ hakios_wifi_network(uint8_t *name, unsigned *name_length, uint8_t *passphrase, unsigned *passphrase_length)
+ {
+-#pragma unused(name, name_length, passphrase, passphrase_length)
+-	return false;
++	uint64_t size = 0;
++	const uint8_t *file = hakios_image_file("fw", "network", &size, NULL), *end, *line;
++	unsigned lengths[2] = { 0, 0 }, sizes[2];
++	uint8_t *where[2];
++
++	if (file == NULL || size == 0) {
++		hakios_wifi_tell("wifi: which network to join: none was given (fw/network of the small image)\n");
++		return false;
++	}
++	sizes[0] = *name_length;
++	sizes[1] = *passphrase_length;
++	where[0] = name;
++	where[1] = passphrase;
++	end = file + size;
++	line = file;
++	for (unsigned n = 0; n < 2 && line < end; n++) {
++		const uint8_t *stop = line;
++
++		while (stop < end && *stop != '\n') {
++			stop++;
++		}
++		lengths[n] = (unsigned)(stop - line) - (stop > line && stop[-1] == '\r' ? 1 : 0);
++		if (lengths[n] > sizes[n]) {
++			lengths[n] = 0;
++		} else {
++			memcpy(where[n], line, lengths[n]);
++		}
++		line = stop + 1;
++	}
++	/* a passphrase is 8 to 63 bytes, or none at all (then the network is open) */
++	hakios_wifi_tell("wifi: which network to join: a name of %u bytes and a passphrase of %u bytes were given\n",
++	    lengths[0], lengths[1]);
++	if (lengths[0] == 0 || (lengths[1] != 0 && (lengths[1] < 8 || lengths[1] > 63))) {
++		hakios_wifi_tell("wifi: that is neither a name of 1 to 32 bytes nor a passphrase of 8 to 63 (an empty "
++		    "second line is an open network)\n");
++		return false;
++	}
++	*name_length = lengths[0];
++	*passphrase_length = lengths[1];
++	return true;
+ }
+ 
+ const uint8_t *

@@ -1,4 +1,4 @@
-# 项目计划（2026-11-03 16:10）
+# 项目计划（2026-11-04 16:2x）
 
 > 这份文档只回答两件事：**现在到哪了**、**接下来按什么顺序打**。
 > 实证记录在 `docs/SESSION-HANDOFF.md`（每条都有真机日志时间戳），文件地图在 `docs/PROJECT-MAP.md`。
@@ -15,8 +15,8 @@
 | 存储读取 | ✅ 完成 | 根卷报 20 GiB / 12.2 GiB 可用（`df` 实测，§13.13） |
 | 存储持久化 | ✅ 完成 | `/private/var` 跨重启保留（§13.15，真机六轮，提交 `9c7b712`） |
 | Settings → Wi-Fi 面板 | ✅ 完成 | 补了 configd / securityd / wifianalyticsd，面板能进（提交 `885af0d`） |
-| **Wi-Fi 无线电** | ❌ 未通 | 无链路（`parf_ltssm 0`），无 en0，扫不到任何 SSID |
-| **系统语言 → 中文** | ❌ 未通 | 种子在设备上完好，UI 仍英文 |
+| **Wi-Fi 无线电** | 🟢 分支已通，main 只带修复 | 分支 `wifi-ref-port`（含 tag `wifi-ref-port-docs`）：链路 L0、固件 AMSS、`en0`、扫描 14 个热点、WPA2 四步握手、**开放网络可加入**、Safari 打开 https 页面（`bing.com` 带锁）全部真机通过；**main 的默认内核仍是自研 `alioth_pcie.c`（Wi-Fi 未通）**，这次只把两处修复带进 main：开放网络放行（`ubuntu/ref-open-network.patch`）与 `com.apple.trustd`/`com.apple.mDNSResponder` 两个守护进程 |
+| **系统语言 → 中文** | 🔍 取证中 | 偏好确实进到 SpringBoard（进程内实测）；卡在 bundle 认定（§13.16） |
 | **默认壁纸** | ❌ 未通 | PosterBoard 从未运行，扩展每次都崩 |
 | **真熄屏** | ❌ 未通 | 黑帧但面板仍通电（DCS 0x28 从未发过） |
 | 音频 / BT / 相机 / 蜂窝 | ⛔ 未开始 | 不在当前阶段 |
@@ -71,20 +71,29 @@
 **为什么现在做**：以前"改成中文"重启就回英文，永远分不清是修复没生效还是被内存盘吞了。
 现在 `/private/var` 会保留，实验第一次可判定。
 
-**已知**：镜像里有 12 个种子文件（`userland/var/mobile/Library/Preferences/` 下，含
-`.GlobalPreferences.plist`），每次启动 graft 进去；资源不是问题——rootfs 里 3,149 个
-`.loctable` 内含中文，`zh-Hans.lproj` 齐备。
+**已经排除的（都有真机证据，见 §13.16）**：
 
-**第一步（先取证，不改代码）**：跑一轮，用 `var_store cat` 读三处，确认 `AppleLanguages`
-到底在哪个域、被谁覆盖：
-`/private/var/mobile/Library/Preferences/.GlobalPreferences.plist`、
-`/private/var/root/Library/Preferences/.GlobalPreferences.plist`、
-`mobile/Library/Preferences/com.apple.springboard.plist`。
+| 假设 | 结论 | 证据 |
+|---|---|---|
+| 种子文件没写上 / 域不对 | ❌ 死 | 三处 `.GlobalPreferences.plist` 都是 `zh-Hans-CN` |
+| cfprefsd 起晚了，进程读到时还是空 | ❌ 死 | SpringBoard **进程内**（uid 501）三种视图都返回 `[zh-Hans-CN, zh-Hans, en]` |
+| 资源里没有中文 | ❌ 死 | `SpringBoard.loctable` 42 种语言、中英同键 438 个，`LOW_BATT_TITLE` = `电池电量不足` |
+| 缺 `zh-Hans.lproj` | ❌ 不是原因 | 真机上 `SpringBoard.app` / `Preferences.app` 也只有 `en.lproj`、`en_GB.lproj` |
 
-**三个假设，按可能性排序**：
-1. **H1 域不对**：cfprefsd 读的是 system 域（`/private/var/preferences/`），我们只种了 mobile 域。
-2. **H2 缺 setup 标记**：`com.apple.purplebuddy` 的 SetupDone 等键缺失，系统按"未初始化"走默认英文。
-3. **H3 时序**：cfprefsd 先于种子启动，读到时还是空，之后不再重读。
+**剩下来的一条**：SpringBoard 是否被**判定**为"有中文"。两个子分支，一次取证就能分开：
+
+- **H4a 只按 `.lproj` 枚举语言** → 只看到 en，回落英文。修法：`Info.plist` 加
+  `CFBundleLocalizations`（不要补空 `zh_CN.lproj`，那会让字符串变成 key）。
+- **H4b 会读 loctable，但读不动这张表** → 同样回落英文。修法在内核 decmpfs-4 读路径上，
+  **和 `PingFang.ttc` 加载失败是同一个根因**（两者都是 type 4）。
+
+**下一步（一轮上机）**：`lang3` 载荷已编好（`out/run-payload-lang3.bin`），上一轮在刷 system.apfs
+阶段被中断，重跑即可。两个探针已经写在 `inject_sb.c` 里：
+
+1. `CFBundleCopyLocalizationsForPreferences(42 种语言, NULL)` → `zh_CN` 还是 `en`？
+2. `CFBundleCopyLocalizedString(board, "LOW_BATT_TITLE", …)` → `电池电量不足` 还是 `<no such key>`？
+
+第 2 条同时回答"这张 loctable 读不读得动"，也就是语言与字体是不是同一件事。
 
 **验收**：主屏 / Settings 文字变中文，**且重启后仍是中文**（这条以前无法验证）。
 
@@ -178,6 +187,9 @@ python tools/logdump.py head 8388608   # 查存档头 RDWVAR
 2. **槽容量是硬门槛**：`newest()` 检查 `h->bytes > SLOT_BYTES - 4096`，改小槽会让旧存档立刻
    失效并打印 `no store yet`（`show` 却仍说 `header right`，很容易误判）。
 3. **跨 shell 的 `$VAR` 会被吞**：WSL 操作一律写脚本文件 + 绝对路径，别拼一行长命令。
+4. **Git Bash 的变量进不了 WSL**：`EXTRA_ARGS=x wsl bash …` 里 WSL 收不到，除非列进 `WSLENV`
+   （`WSLENV=EXTRA_ARGS EXTRA_ARGS=x wsl bash …`）。`lang2` 那一轮就是这么白跑的：命令行里
+   没有 `lang_probe=1`，探针一次都没跑。
 
 ---
 
@@ -208,3 +220,11 @@ python tools/logdump.py head 8388608   # 查存档头 RDWVAR
 
 - **2026-11-03 16:10**：初版。存储显示（`3c3df45`）与持久化（`9c7b712`）已关；主线收敛到
   Wi-Fi 链路；本周先交付中文语言；新增 P1「ramfs 名字查找 bug」。
+- **2026-11-04 16:25**：**Wi-Fi 在分支上打通**（`wifi-ref-port`），main 只并入两处修复：开放网络放行补丁、
+  `trustd` + `mDNSResponder`。合并范围已按"只挑修复"收窄——整套参考实现路线留在分支上，未进 main。
+  真机实测同时暴露：参考内核的 GPU/电池驱动是旧一版分支（`hakios.adreno.c` 4875 行 vs 自研
+  `redwood_adreno.c` 5105 行），表现为卡顿与电量显示偏低，所以**日常用机仍走自研内核**。
+- **2026-11-03 16:50**：语言取证（§13.16）。三处 prefs 域名 + 进程内实测把 H1/H3 全部排除；
+  loctable 里有真中文（438 键）；问题收敛到"SpringBoard 是否被判为有中文"，并给出一次上机
+  即可分开的 H4a/H4b。探针首轮把 SpringBoard 打崩（`AppleLocale` 当数组打印），已修；
+  `lang3` 载荷编好但上机被中断，等待重跑。

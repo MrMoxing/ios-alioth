@@ -19,3 +19,12 @@ Thumbs.db
 # 启动脚本的临时输出（每次运行覆盖）
 boot-*.out
 reference/
+
+# 每次实验打出来的载荷（每个几十 MB，一台机器一份；交付用的是 boot/run-payload.bin）
+boot/run-payload-*.bin
+boot/kernel-nofix.bin
+boot/kernel-p1src.bin
+boot-resume.ps1
+
+# 本地工作区数据（不进仓库）
+.workbuddy/
