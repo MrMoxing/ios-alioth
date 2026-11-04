@@ -227,7 +227,38 @@ for (int left = seconds * 5; left > 0; left--) usleep(200000);
 驱动自己连，不需要设置页；或者跑一轮不自动返回的（`SECS` 长、`REBOOT=0`），由人手动点开 Wi-Fi 面板，
 再从日志里读扫描结果。
 
-### 5.4 下一步
+### 5.4 扫到、并且连上了（15:1x，真机，`runs/wifihand3.log.txt`）
+
+手动点开 Settings → Wi-Fi（这一步自动化做不了，原因见 §5.3），射频侧一次就到位：
+
+```
+lx: THE SCAN HEARD 14 NETWORKS (access points): 8 at 2.4 GHz, 6 at 5 GHz;
+    by channel: 2 on 1, 3 on 6, 3 on 11, 2 on 36, 2 on 44, 2 on 157,
+    the strongest at -16 dBm, the weakest at -92; 13 open, 0 without a name
+lx: the network that is wanted: an access point on channel 6 (2437 MHz) at -16 dBm,
+    capabilities 0x1431 … WPA2 with a passphrase and CCMP: it can be joined
+lx: AUTHENTICATION: the access point accepts (status 0)
+lx: ASSOCIATION: THE ACCESS POINT ACCEPTS (status 0); we are its station number 2
+lx: THE KEYS ARE GIVEN TO THE DRIVER, 33 ms after the association
+lx: THE NETWORK IS JOINED: frames can pass
+lx: the network is joined, 35 s after it was joined: 18 frames sent (0 could not be),
+    4 received for us and 0 sent to everybody; 2 messages of the handshake
+```
+
+屏幕上出现的真实热点（截图 `docs/evidence/2026-11-04-wifi-joined.png`）：
+`SDP-WeNet`（-54）、`SDP-WeNet-Teacher`、`OnePlusAce 6`（-7，就是它连上的那个）、
+`h#hMagic8 Pro`，另有一个中文 SSID 显示成乱码。**四步握手完成，帧可以通过。**
+
+**到此为止，M3（扫到 SSID）与 WPA2 关联都通了。** 差最后一段：IP。日志里五个
+`failed lookup: com.apple.networkd_privileged` —— 这个守护进程不在我们的 job 列表里，
+所以 DHCP 没跑，`en0` 还没有地址。
+
+### 5.5 下一步：把 `networkd_privileged` 加进 job 列表，让它拿 IP
+
+`build.sh` 的默认 daemon 列表里没有 `com.apple.networkd_privileged`；补上它（可能还需要
+`com.apple.networkd`、`com.apple.apsd`），重启后看 `en0` 是否拿到 DHCP 地址，然后才是 Safari。
+
+### 5.6 下一步（旧）
 
 1. 进 Settings → Wi-Fi 看是否扫到 SSID（可以用 `rwtouch` 点，或手动点）。
 2. 能扫到就把网络写进 `fw/network`（参考实现的 `lx_os_network`：第一行 SSID、第二行密码）试连。

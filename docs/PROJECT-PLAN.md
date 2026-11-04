@@ -15,7 +15,7 @@
 | 存储读取 | ✅ 完成 | 根卷报 20 GiB / 12.2 GiB 可用（`df` 实测，§13.13） |
 | 存储持久化 | ✅ 完成 | `/private/var` 跨重启保留（§13.15，真机六轮，提交 `9c7b712`） |
 | Settings → Wi-Fi 面板 | ✅ 完成 | 补了 configd / securityd / wifianalyticsd，面板能进（提交 `885af0d`） |
-| **Wi-Fi 无线电** | 🟡 大半通 | 链路 L0（`24f4d4a`）、固件搬到 AMSS、**`en0` 起来、ath11k 返回 0**（照搬参考实现，§13.18）；扫描未拿到 |
+| **Wi-Fi 无线电** | 🟢 快通了 | 链路 L0、固件到 AMSS、`en0`、**扫到 14 个热点、WPA2 关联成功、帧可以通过**（15:1x 真机）；只差 DHCP 地址 |
 | **系统语言 → 中文** | 🔍 取证中 | 偏好确实进到 SpringBoard（进程内实测）；卡在 bundle 认定（§13.16） |
 | **默认壁纸** | ❌ 未通 | PosterBoard 从未运行，扩展每次都崩 |
 | **真熄屏** | ❌ 未通 | 黑帧但面板仍通电（DCS 0x28 从未发过） |
@@ -166,8 +166,9 @@ PHY 的 ready 极性是 `bit6=1` 为**已就绪**。
 | **M1 设置能留住** | 中文改一次 → 重启 → 仍中文；Wi-Fi 面板里的开关状态也留住 | 本周 |
 | **M2 认出 endpoint** | `17cb:1101`，LTSSM L0 | ✅ 11-03（`24f4d4a`） |
 | **M2.5 无线电起来** | `en0` 存在、`ath11k returned 0`、station 交给 iOS | ✅ 11-04（照搬路线，§13.18） |
-| **M3 扫到 SSID** | Settings → Wi-Fi 列出真实热点（不是模拟） | 只差这一步 |
-| **M4 真的联网** | 输入密码 → 关联 → DHCP → Safari 打开页面 | 视 M3 的固件 / 协议栈进展 |
+| **M3 扫到 SSID** | Settings → Wi-Fi 列出真实热点 | ✅ 11-04 15:1x（14 个热点，§5.4） |
+| **M3.5 WPA2 关联** | `ASSOCIATION … station number 2`、`THE NETWORK IS JOINED` | ✅ 11-04 15:1x |
+| **M4 真的联网** | 关联 → DHCP → Safari 打开页面 | 只差 DHCP（`networkd_privileged` 未在 job 列表） |
 | **M5 观感补齐** | 默认壁纸 + 图标布局跨重启保留 | 与 M2 并行 |
 
 ---
