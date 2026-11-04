@@ -585,6 +585,17 @@ if [ -f ../fw-wifi/wpss.mdt ]; then
 	# SHARE=1: leave it out, for an image that is going to somebody else -- it is a passphrase
 	if [ -z "$SHARE" ] && [ -f ../fw-wifi/network ]; then install -m 0600 ../fw-wifi/network root/fw/network; fi
 fi
+# ... and the QCA6390's own firmware for the reference implementation's ath11k (QCA=1, the branch
+# wifi-ref-port): amss20/m3/board/regdb out of ../fw-qca, under the names its loader asks for
+# (hakios.lx.c maps m3.bin, board.bin and regdb.bin onto these). Off by default: they are 4.6 MB in
+# the payload that our own driver does not use yet.
+if [ -n "$QCA" ] && [ -d ../fw-qca ]; then
+	mkdir -p root/fw
+	install -m 0644 ../fw-qca/amss20.bin root/fw/qca6390_amss20.bin
+	install -m 0644 ../fw-qca/m3.bin root/fw/qca6390_m3.bin
+	install -m 0644 ../fw-qca/bdwlan.elf root/fw/qca6390_bd_k11a.elf
+	install -m 0644 ../fw-qca/regdb.bin root/fw/qca6390_regdb.bin
+fi
 # ... and the vibration motor's waveforms, the phone's /vendor/firmware/aw8697_haptic.bin, from ../fw-haptic
 # (bsd/dev/redwood_haptic.c, haptic=3; 3.6 KB, the vendor's and not in the repository either)
 if [ -f ../fw-haptic/aw8697_haptic.bin ]; then
