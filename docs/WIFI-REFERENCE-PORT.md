@@ -184,6 +184,14 @@ $ sleep 30
 **结论：这套内核里，用户态 `sleep()` 一次之后就再也不返回**，所有"等一会儿再做"的自动化都失效。
 所以扫描这一步不该再靠延时触发。
 
+再进一步：把定时器换成 `pthread` 也只成了一次。`wifiopen3` 里线程的**第一次** `sleep(6)` 回来了
+（`timer 25 s: heartbeat 1`），第二次没有；把设计改成"只睡一次"（`start_after(10)` → `unlock()` →
+开面板）后，`wifiscan7` 只留下 `redwood: start_after(10) called`，**10 秒的这一次也没回来**。
+所以在这套内核上，用户态定时器不是"慢"，是**偶发地永远不醒**——任何"等一会儿再做"的自动化都不可靠。
+
+（注意：这不是 iOS 本身的问题，wifid/launchd 的定时器都在跑；是本移植的内核里，我们这些
+进程/线程的 `sleep` 与 `dispatch_after` 醒来这一侧不可靠。）
+
 **下一步（不依赖计时器）**：挂在事件上——`libredwood-sb.dylib` 已经处理解锁
 （`com.redwood.unlock` → `unlock()`，每次开机自动解锁时会走一遍），在 `unlock()` 之后顺手
 `open_wifi_settings()`，条件是标记文件在。解锁是 SpringBoard 自己的事件，不需要任何 sleep。

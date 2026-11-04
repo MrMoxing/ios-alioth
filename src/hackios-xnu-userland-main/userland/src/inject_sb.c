@@ -1422,25 +1422,28 @@ language_state(const char *when)
  * "25 s in", on our own kernel as well as on the reference one. notify_register_dispatch does work
  * there (com.redwood.lang is answered), which is what made the blocks look plausible.
  */
-static void open_wifi_settings(void);      /* defined below, used by the timer thread */
+static void open_wifi_settings(void);      /* both defined below, used by the timer thread */
+static void unlock(void);
 
 static void *
 after_delay(void *argument)
 {
 	int seconds = (int)(intptr_t)argument;
 
-	/* a heartbeat first: if these do not come out, the thread never ran; if not even the first
-	 * one does, start_after() itself was never reached */
-	say("redwood: timer for %d s armed\n", seconds);
-	for (int i = 1; i <= 3; i++) {
-		sleep((unsigned)(seconds / 4));
-		say("redwood: timer %d s: heartbeat %d\n", seconds, i);
-	}
-	sleep((unsigned)(seconds / 4));
+	/*
+	 * One sleep, and no heartbeat. A thread here wakes from its first sleep and then never
+	 * again (wifiopen3: "heartbeat 1", nothing after it), so a single wait is the only kind
+	 * that can be relied on -- and one is all this needs.
+	 *
+	 * What it does is the boot's unlock, which used to be a dispatch_after block and therefore
+	 * never happened in this library; and, when the run asked for it by making the marker file,
+	 * Settings' Wi-Fi pane right after it -- the pane is what makes wifid ask the radio for a
+	 * scan, and nothing else does.
+	 */
+	sleep((unsigned)seconds);
+	unlock();
 	if (access("/private/var/mobile/open-wifi", F_OK) == 0) {
 		open_wifi_settings();
-	} else {
-		say("redwood: no marker for Settings; nothing to open\n");
 	}
 	return NULL;
 }
@@ -1552,13 +1555,12 @@ redwood_springboard_init(void)
 		size_t size = sizeof(arguments) - 1;
 
 		/*
-		 * Settings' Wi-Fi pane, on a marker file the run itself makes
-		 * (rc.jobs.wifiscan: var_store stamp /private/var/mobile/open-wifi). Two reasons it is
-		 * not decided here and now: SpringBoard is still laying out its icons this early, and the
-		 * marker does not exist yet at this point of the boot either. The checks are late ones.
+		 * The boot's unlock, ten seconds in -- and Settings' Wi-Fi pane straight after it when the
+		 * run asked for it by making /private/var/mobile/open-wifi (rc.jobs.wifiscan). A thread,
+		 * not dispatch_after: a block scheduled here never ran (thirteen "ln: at start" in the
+		 * language runs, not one "25 s in").
 		 */
-		start_after(25);
-		start_after(55);
+		start_after(10);
 		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 &&
 		    strstr(arguments, "lang_probe=1") != NULL) {
 			language_state("at start");
@@ -1698,7 +1700,5 @@ redwood_springboard_init(void)
 			return;
 		}
 	}
-	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-		unlock();
-	});
+	/* the unlock is the timer started above, as a thread: see after_delay() */
 }
