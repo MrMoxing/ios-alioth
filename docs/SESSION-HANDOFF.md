@@ -1376,3 +1376,28 @@ read back the same; 0 refused`，返回前 1.5 s 保存完），说明存档不�
 **中断时的现场**：`lang3` 上机跑到"刷 system.apfs"这一步被打断，手机**现在停在 loader 里**
 （`fastboot devices` 显示 `xnuloader`），没有写任何分区。下一轮可以直接接着 stage + run；
 想先回 Android 就 `fastboot reboot`。
+
+### 13.19 Wi-Fi 在分支上打通；main 只取两处修复（11-04 16:2x）
+
+**结论先行**：Wi-Fi 全链路已在分支 `wifi-ref-port` 上真机跑通（含 tag `wifi-ref-port-docs`），
+但**没有整套并入 main**——main 只收两处对任何内核都成立的修复，自研内核与它的 GPU/电池/熄屏行为不变。
+
+**分支上已验证的（真机）**：链路 L0（`parf_ltssm 0x111`、`17cb:1101`）→ BHI 送 512 KiB SBL →
+MHI M0 → BHIE 送 4,352,144 B AMSS（9 段）→ `unified ready` → QMI 下 BDF/board/m3 →
+`en0` + `ath11k returned 0` → 扫到 14 个热点 → WPA2 `AUTHENTICATION 0` / `ASSOCIATION … station 2` /
+`THE KEYS ARE GIVEN`, `THE NETWORK IS JOINED` → 开放网络可加入 → Safari 打开 `bing.com`（带锁）。
+
+**进 main 的两处修复**：
+
+| 修复 | 位置 | 为什么它与内核无关 |
+|---|---|---|
+| 开放网络放行 | `ubuntu/ref-open-network.patch`（611 行） | 参考实现里 `station_join()` 第一行按 `security != WPA2` 拒绝，`protection()` 再拒一次；补丁放行 `HAKIOS_STA_OPEN`、不置 Privacy 位、跳过四步握手 |
+| 解析与证书 | `build.sh` 的 `com.apple.mDNSResponder`、`com.apple.trustd` | 两个程序和 plist 本来就在镜像里，只是从没进过 job 列表；少前者"找不到服务器"，少后者"连接不是私密" |
+
+**为什么不全并**：真机实测发现参考内核的 GPU 与电池驱动是旧一版分支（`hakios.adreno.c` 4875 行
+vs 自研 `redwood_adreno.c` 5105 行；电池 419 vs 415），表现为**明显卡顿**与**电量长期偏低**。
+两套内核各有所长：参考那套 Wi-Fi 通、GPU/电池弱；自研那套反过来。要合一，得把自研的 GPU/电池
+（和熄屏路径）搬进参考树，或者把 Wi-Fi 栈搬进自研树——那是下一步的独立工作，不该混在"合并修复"里。
+
+**留下一句话给下一次**：从入口读代码。开放网络被拒了四轮，前四轮都在改 `protection()`，
+而真正的闸门在 `station_join()` 的第一行——症状附近不等于原因附近。

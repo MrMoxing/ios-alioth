@@ -1,4 +1,4 @@
-# 项目计划（2026-11-03 16:50）
+# 项目计划（2026-11-04 16:2x）
 
 > 这份文档只回答两件事：**现在到哪了**、**接下来按什么顺序打**。
 > 实证记录在 `docs/SESSION-HANDOFF.md`（每条都有真机日志时间戳），文件地图在 `docs/PROJECT-MAP.md`。
@@ -15,7 +15,7 @@
 | 存储读取 | ✅ 完成 | 根卷报 20 GiB / 12.2 GiB 可用（`df` 实测，§13.13） |
 | 存储持久化 | ✅ 完成 | `/private/var` 跨重启保留（§13.15，真机六轮，提交 `9c7b712`） |
 | Settings → Wi-Fi 面板 | ✅ 完成 | 补了 configd / securityd / wifianalyticsd，面板能进（提交 `885af0d`） |
-| **Wi-Fi 无线电** | ❌ 未通 | 无链路（`parf_ltssm 0`），无 en0，扫不到任何 SSID |
+| **Wi-Fi 无线电** | 🟢 分支已通，main 只带修复 | 分支 `wifi-ref-port`（含 tag `wifi-ref-port-docs`）：链路 L0、固件 AMSS、`en0`、扫描 14 个热点、WPA2 四步握手、**开放网络可加入**、Safari 打开 https 页面（`bing.com` 带锁）全部真机通过；**main 的默认内核仍是自研 `alioth_pcie.c`（Wi-Fi 未通）**，这次只把两处修复带进 main：开放网络放行（`ubuntu/ref-open-network.patch`）与 `com.apple.trustd`/`com.apple.mDNSResponder` 两个守护进程 |
 | **系统语言 → 中文** | 🔍 取证中 | 偏好确实进到 SpringBoard（进程内实测）；卡在 bundle 认定（§13.16） |
 | **默认壁纸** | ❌ 未通 | PosterBoard 从未运行，扩展每次都崩 |
 | **真熄屏** | ❌ 未通 | 黑帧但面板仍通电（DCS 0x28 从未发过） |
@@ -220,6 +220,10 @@ python tools/logdump.py head 8388608   # 查存档头 RDWVAR
 
 - **2026-11-03 16:10**：初版。存储显示（`3c3df45`）与持久化（`9c7b712`）已关；主线收敛到
   Wi-Fi 链路；本周先交付中文语言；新增 P1「ramfs 名字查找 bug」。
+- **2026-11-04 16:25**：**Wi-Fi 在分支上打通**（`wifi-ref-port`），main 只并入两处修复：开放网络放行补丁、
+  `trustd` + `mDNSResponder`。合并范围已按"只挑修复"收窄——整套参考实现路线留在分支上，未进 main。
+  真机实测同时暴露：参考内核的 GPU/电池驱动是旧一版分支（`hakios.adreno.c` 4875 行 vs 自研
+  `redwood_adreno.c` 5105 行），表现为卡顿与电量显示偏低，所以**日常用机仍走自研内核**。
 - **2026-11-03 16:50**：语言取证（§13.16）。三处 prefs 域名 + 进程内实测把 H1/H3 全部排除；
   loctable 里有真中文（438 键）；问题收敛到"SpringBoard 是否被判为有中文"，并给出一次上机
   即可分开的 H4a/H4b。探针首轮把 SpringBoard 打崩（`AppleLocale` 当数组打印），已修；
