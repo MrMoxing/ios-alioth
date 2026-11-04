@@ -1,0 +1,10 @@
+# The Chinese the UI asks for: PingFang.ttc is a decmpfs file (type 4, zlib in the resource fork),
+# and CoreText says it cannot be loaded while the host-side reader decompresses it without trouble.
+# This run asks the same question of the phone's own driver: the hash of the whole file read
+# through read(2) and through a mapping, side by side, which is how a pager that does not
+# decompress shows itself.
+/redwood/bin/vol_ls stat /System/Library/Fonts/LanguageSupport/PingFang.ttc
+/redwood/bin/vol_ls hash /System/Library/Fonts/LanguageSupport/PingFang.ttc
+/redwood/bin/vol_ls cat /System/Library/Fonts/LanguageSupport/PingFang.ttc 16
+/redwood/bin/var_store cat /private/var/mobile/Library/Preferences/.GlobalPreferences.plist 200
+/redwood/bin/var_store cat /private/var/preferences/.GlobalPreferences.plist 200

@@ -1,18 +1,16 @@
 # Opening Settings' Wi-Fi pane, so that something asks the radio to scan.
 #
-# iOS lists networks only while the Wi-Fi pane is open: wifid asks apple80211 for a scan, the
-# reference implementation's lx layer hands it to ath11k, the firmware answers. The pane is opened
-# by libredwood-sb.dylib, which answers the notification com.redwood.wifi by asking LaunchServices
-# for "App-Prefs:root=WIFI" (src/inject_sb.c).
+# iOS lists networks only while that pane is open: wifid asks apple80211 for a scan, the reference
+# implementation's lx layer hands it to ath11k, the firmware answers. The pane is opened inside
+# SpringBoard by libredwood-sb.dylib, which answers com.redwood.wifi by asking LaunchServices for
+# "App-Prefs:root=WIFI" (src/inject_sb.c, open_wifi_settings).
 #
-# The notification is posted by a program of its own after a `sleep`, not by rwtouch's own `wait`:
-# `rwtouch wait 25 notify com.redwood.wifi` printed its command line and then never came back
-# (wifiscan3, 13:51), while `sleep 40` followed by `rwtouch notify` is exactly what rc.jobs.lang
-# does and it is answered every time.
-#
-# 30 s is after SpringBoard has its icons; 60 s more keeps the run alive while the pane scans.
-sleep 30
+# The wait is a `sleep` of its own -- a fresh process that sleeps once -- and then rwtouch only posts
+# the notification. That split is the one that works: src/sleep_test.c (rc.jobs.sleep) showed six
+# waits in one process coming back on the dot (3, 202, 1003, 5004, 2004, 2004 ms) and the seventh
+# never returning, and a thread inside SpringBoard woke from one sleep and not its second. So no
+# process here waits twice, and SpringBoard waits not at all.
+sleep 20
 /redwood/bin/rwtouch notify com.redwood.wifi
-sleep 60
+sleep 20
 /redwood/bin/rwtouch notify com.redwood.wifi
-sleep 40

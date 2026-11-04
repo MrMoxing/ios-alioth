@@ -212,6 +212,9 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		$DYN -Wno-four-char-constants -framework CoreFoundation -framework IOSurface \
 			-framework IOKit -o obj/drawable_test src/drawable_test.c src/redwooddrawable.m
 		$DYN -o obj/rwtouch src/rwtouch.c
+		# which wait comes back in this kernel: the reference port stops waking up after its first
+		# sleep, and this says which primitive does it (rc.jobs.sleep)
+		$DYN -o obj/sleep_test src/sleep_test.c
 		$DYN -framework CoreFoundation -framework AudioToolbox -framework AVFoundation -lobjc -o obj/sound_test src/sound_test.c
 		$DYN -framework CoreFoundation -lMobileGestalt -o obj/mg_test src/mg_test.c
 		$DYN -framework CoreFoundation -framework AVFoundation -lobjc -o obj/torch_test src/torch_test.c
@@ -380,6 +383,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	fi
 	# (drawable_test is built in the same block as surf_test, so it is copied with it)
 	cp obj/hello_dyn obj/svc_test obj/surf_test obj/drawable_test obj/rwtouch obj/mg_test root/bin/
+	[ -f obj/sleep_test ] && cp obj/sleep_test root/bin/
 	[ -f obj/cpu_test ] && cp obj/cpu_test root/bin/        # (a prebuilt/ from before this program has none)
 	[ -f obj/cow_test ] && cp obj/cow_test root/bin/
 	[ -f obj/cg_test ] && cp obj/cg_test root/bin/

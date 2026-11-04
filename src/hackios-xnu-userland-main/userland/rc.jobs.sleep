@@ -1,0 +1,7 @@
+# Which wait comes back in this kernel (src/sleep_test.c).
+#
+# The reference port's Wi-Fi works until something has to wait: `sleep 30` in a job never returned,
+# dispatch_after blocks never ran, and a thread woke from its first sleep but not its second. This
+# prints a line before and after each primitive, so the last "asked" in the log is the one that hung.
+/redwood/bin/sleep_test
+/redwood/bin/var_store show

@@ -1376,3 +1376,61 @@ read back the same; 0 refused`，返回前 1.5 s 保存完），说明存档不�
 **中断时的现场**：`lang3` 上机跑到"刷 system.apfs"这一步被打断，手机**现在停在 loader 里**
 （`fastboot devices` 显示 `xnuloader`），没有写任何分区。下一轮可以直接接着 stage + run；
 想先回 Android 就 `fastboot reboot`。
+
+### 13.17 PCIe 链路训练成功：Perst 在第 11 步放开，LTSSM 到 L0，端点 17cb:1101（11-03 23:37，提交 24f4d4a）
+
+**一句话**：`parf_ltssm` 读回 **0x111（L0）**，配置空间里认出 `vendor 17cb, device 1101`。
+这条从 10-23 起卡了十一天的"链路从未训练过"，结在三处，都是对照厂商树
+（`Xiaomi_Kernel_OpenSource-alioth-r-oss`）与手机自己的 DT 找出来的：
+
+| 死因 | 说明 |
+|---|---|
+| **WLAN_EN 引脚读在 TLMM 的空洞里** | gpio 20 属北片，`pinctrl-kona.c` 把各片交错排布，基址要用 `0x0f914000` 而不是单一片的偏移 |
+| **PHY 参考时钟的配置字** | 写 `0x501` 才对（父时钟表里根本没有这个源）；`0x105` 去要 GPLL0/6 的 100 MHz，DT 要的正是这个 |
+| **PHY 复位在寄存器序列之后** | 序列写完再脉冲复位会把刚配好的东西清掉；厂商是**时钟开着、序列之前**脉冲 `0x6c01c`，且从不碰 `0x6f000/0x6f010` |
+
+**顺序**：RPMh 投票先落地（ldoa9 1.2 V、ldoa5 0.88 V、cx 256，经 `0x18220000` 的 sequencer）→
+p24 量到 PHY ready（status `0xa6`，pipe clock 62.4 MHz）→ p25 的第 11 步在状态机打开后 **15 ms** 链路起。
+
+**顺带**：`boot-one.sh` 现在每次运行前擦掉 logdump（一轮一份干净日志，Android 侧写入会被拒），
+`tools/` 里留了审计与实验脚本（`asm-strings.py`、`dtparse.py`、`phydiff.py`、`mkpNN.sh` 等）。
+
+### 13.18 照搬参考实现的 Wi-Fi：整套跑通到 en0（11-04 12:4x–14:5x，分支 `wifi-ref-port`）
+
+**一句话**：把 `Klipboard2022/k40-ios-experiments` 的方案整套搬过来——**Linux 7.0.14 的 ath11k
+原样编译进 XNU**（FreeBSD 15.1 的 LinuxKPI + 它自写的 `wifi/lx` 垫层）——在本机跑到了
+`en0` 建起来、`ath11k returned 0`。细节与全部日志摘录在 `docs/WIFI-REFERENCE-PORT.md`。
+
+**构建**（`ubuntu/ref-wifi-build.sh`）：
+
+| 步骤 | 结果 |
+|---|---|
+| `patches/hakios-k40-r45.patch` @ `ufogxl/hackios-alioth 569a9cc` | 干净应用 |
+| `xnu/apply.sh`（`XNU_URL=file://…/xnu-8796.121.2`，用本地克隆喂源） | 193 个文件 |
+| 两份源码 | Linux 157 MB（aliyun 1.9 MB/s）、FreeBSD 253 MB（ustc 1.6 MB/s）；官方站 36 KB/s / 连不上 |
+| `tools/mk-ath11k.sh` | **`ath11k.o` 764,492 B，stubs 0 行** |
+| `xnu-build.sh` | 内核 **15,722,736 B**，内含 **811 个 `ath11k` 字符串** |
+
+**两个坑都是 CRLF**：仓库的 bash 脚本；`doconf` 是 **csh** 脚本，CRLF 会让它八个目录各报一次
+`set: Variable name must begin with a letter`（看起来像工具链崩了，其实是行尾）。
+
+**真机**（我们的 loader + 我们的 `system.apfs`，参考内核）：
+
+| 轮 | 结果 |
+|---|---|
+| `refwifi` | 固件名不对 → `pinned device firmware absent` |
+| `refwifi2` | 全链条：BHI 送 512 KiB SBL → MHI M0 → BHIE 送 4,352,144 B AMSS（9 段）→ `unified ready` → QMI 下 BDF/board/m3 → 射频注册、CN 监管域；**差 MAC**（`THE RADIO HAS NO ADDRESS`） |
+| `refwifi3` | 加 `wifi_mac=6c:f7:84:8b:81:b0` → `station address validated`、**`en0` 起来**、`configd` 自配、**`ath11k returned 0`**、station 交给 iOS |
+
+**还没拿到**：扫描。iOS 只在 Wi-Fi 面板打开时才让 wifid 扫描，而"把面板打开"的七轮自动化全部失败，
+根因是**这套内核上我们的用户态定时器不可靠**：`sleep 30` 不返回（日志停在那一行）、`dispatch_after`
+从不执行（13 次 `at start`、0 次 `25 s in`）、`pthread` 的第一次 `sleep(6)` 回来了第二次没有、
+改成"只睡一次 10 s"后连那一次也没回来。iOS 自己的定时器是正常的，问题只在我们的进程/线程醒来一侧。
+
+**这一步的意义**：我们自己的 `alioth_pcie.c` 缺的不是"再补一个寄存器"，而是参考实现整套：
+**SMMU 页表（SID `0x1c01`、IOVA `0xa0000000`）+ BHI 只装 512 KiB SBL + BHIE 9 段 AMSS +
+写 BHI 前 `PCIE_SOC_GLOBAL_RESET` 并等 PBL + 802.11 状态机（ath11k）**。
+所以路线选择第一次变得清楚：整包采用，或把前四条补进我们自己的驱动。
+
+**开机参数**（参考实现自己的开关，`hakios_wifi_option` 读它们）：
+`pcie_step=31 pcie_at=2 pcie_ipcr=2 wifi_lx=2 wifi_quiet=1 wifi_station=1 wifi_keep=1 wifi=1 wifi_mac=<本机>`

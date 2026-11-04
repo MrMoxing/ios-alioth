@@ -192,6 +192,33 @@ $ sleep 30
 （注意：这不是 iOS 本身的问题，wifid/launchd 的定时器都在跑；是本移植的内核里，我们这些
 进程/线程的 `sleep` 与 `dispatch_after` 醒来这一侧不可靠。）
 
+### 5.3.2 用探针量出来：短等待正常，等待久了就不醒（`rc.jobs.sleep`，15:0x）
+
+`src/sleep_test.c` 一个进程里依次问每一种等待，各打一行 before/after：
+
+```
+usleep(1000)    came back after    3 ms
+usleep(200000)  came back after  202 ms
+sleep(1)        came back after 1003 ms
+sleep(5)        came back after 5004 ms
+nanosleep(2 s)  came back after 2004 ms
+select(2 s)     came back after 2004 ms
+sleep(1) again  asked …（再没有回来）
+```
+
+**结论**：等待本身是对的（六个都准到毫秒），**同一个进程里第七次等待永远不醒**；
+而 `rwtouch wait 25` 这种"一次长等待"在 `wifiscan3` 里也没回来。再往前推一层，
+场景里的 `sleep N` 并不是 `sleep(2)`，而是 `init.c` 的内建实现——**`N*5` 次 `usleep(200000)`**：
+
+```c
+for (int left = seconds * 5; left > 0; left--) usleep(200000);
+```
+
+所以 `sleep 20` 在这个内核上大约 **1.4 秒后就死在第七个 200 ms 上**，
+之前所有"等了 20/30/40 秒"的场景其实都没等到，日志停在命令行那一行。
+
+**这解释了全部七轮失败**，也划出了可用的边界：**单次、几秒以内的等待可以用；再长就不可靠。**
+
 **下一步（不依赖计时器）**：挂在事件上——`libredwood-sb.dylib` 已经处理解锁
 （`com.redwood.unlock` → `unlock()`，每次开机自动解锁时会走一遍），在 `unlock()` 之后顺手
 `open_wifi_settings()`，条件是标记文件在。解锁是 SpringBoard 自己的事件，不需要任何 sleep。

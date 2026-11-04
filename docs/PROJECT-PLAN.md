@@ -1,4 +1,4 @@
-# 项目计划（2026-11-03 16:50）
+# 项目计划（2026-11-04 15:0x）
 
 > 这份文档只回答两件事：**现在到哪了**、**接下来按什么顺序打**。
 > 实证记录在 `docs/SESSION-HANDOFF.md`（每条都有真机日志时间戳），文件地图在 `docs/PROJECT-MAP.md`。
@@ -15,14 +15,16 @@
 | 存储读取 | ✅ 完成 | 根卷报 20 GiB / 12.2 GiB 可用（`df` 实测，§13.13） |
 | 存储持久化 | ✅ 完成 | `/private/var` 跨重启保留（§13.15，真机六轮，提交 `9c7b712`） |
 | Settings → Wi-Fi 面板 | ✅ 完成 | 补了 configd / securityd / wifianalyticsd，面板能进（提交 `885af0d`） |
-| **Wi-Fi 无线电** | ❌ 未通 | 无链路（`parf_ltssm 0`），无 en0，扫不到任何 SSID |
+| **Wi-Fi 无线电** | 🟡 大半通 | 链路 L0（`24f4d4a`）、固件搬到 AMSS、**`en0` 起来、ath11k 返回 0**（照搬参考实现，§13.18）；扫描未拿到 |
 | **系统语言 → 中文** | 🔍 取证中 | 偏好确实进到 SpringBoard（进程内实测）；卡在 bundle 认定（§13.16） |
 | **默认壁纸** | ❌ 未通 | PosterBoard 从未运行，扩展每次都崩 |
 | **真熄屏** | ❌ 未通 | 黑帧但面板仍通电（DCS 0x28 从未发过） |
 | 音频 / BT / 相机 / 蜂窝 | ⛔ 未开始 | 不在当前阶段 |
 
-**当前唯一主线**：Wi-Fi 链路（把 endpoint `17cb:1101` 认出来）。
-**本周可交付**：中文语言 + 结论文档（持久化刚通，这条验证路径第一次成立）。
+**当前唯一主线**：Wi-Fi 的最后一层——让 iOS 真的去扫描并连上。
+**路线已定**：分支 `wifi-ref-port` 上整套照搬参考实现（Linux ath11k 编进 XNU），
+它已经跑到 `en0` + `ath11k returned 0`；`main` 保留我们自己那份 `alioth_pcie.c`。
+**本周可交付**：扫到 SSID（或证明"扫描"被内核定时器问题挡住，答案同样明确）。
 
 ---
 
@@ -97,26 +99,31 @@
 
 **验收**：主屏 / Settings 文字变中文，**且重启后仍是中文**（这条以前无法验证）。
 
-### P0-2 Wi-Fi 链路（1–3 周，主线）
+### P0-2 Wi-Fi（主线，剩下的最后一层）
 
-**现状**：PCIe 驱动 `alioth_pcie.c` 922 行 / 11 步，`parf_ltssm 0`——链路从未训练过。
-成品内核（10-26，15,750,440 B 带符号表）跑通过 Wi-Fi，字符串实证它有全套：
-`WLAN_EN GPIO20` / `PERST released` / `LTSSM enable (vendor bit 8)` / `configure CFG0 iATU` /
-`endpoint BAR0` / `MHI` / `register WLFW events, announce QCA6390 host capabilities`。
+**已通的（真机）**：
 
-| 步骤 | 内容 | 判据 |
+| 层 | 证据 | 在哪条路线 |
 |---|---|---|
-| 2.1 | **先确认成品源码是否公开**（`oosexgang/hackios-xnu-kernel`、K40 移植者仓库） | 有则省下几周 |
-| 2.2 | 引脚：PERST(79) / CLKREQ / WAKE 读回，**WLAN_EN(GPIO20) 拉高** | 日志 `PERST released` / `WLAN_EN GPIO20` |
-| 2.3 | PMIC 电源轨：`smpa4/5/6`（+smpc8）经 SPMI/RPMh 投票 | 读回电压 / 使能位 |
-| 2.4 | LTSSM vendor bit8 → 等链路 | `link at N ms: LTSSM %#x`，Gen1 x1 |
-| 2.5 | CFG0 iATU unroll → 读 `17cb:1101` | `QCA6390 endpoint identified` |
-| 2.6 | 之后：BAR0 一致性 → MHI/BHI → QRTR → ath11k CE pipes（协议栈，1–3 月，视 2.1 结果） | 能扫到 SSID（M3） |
+| 链路 L0 | `parf_ltssm 0x111`、端点 `17cb:1101` | 我们自己的 `alioth_pcie.c`（`24f4d4a`）与照搬路线都有 |
+| 固件搬运 | BHI 512 KiB SBL → MHI M0 → BHIE 4,352,144 B AMSS（9 段）→ `execenv 0x2` | 照搬路线（§13.18） |
+| 协议栈 | QMI 下 BDF/board/m3、`firmware init done`、`wlan mode 0`、`unified ready` | 照搬路线 |
+| 接口 | **`en0` 建起来、`configd` 自配、`ath11k returned 0`** | 照搬路线 |
 
-**三条红线**：
-1. 任何一步碰 `0x60000000` / `0x60100000` 之前，必须先确认链路已训练（已两次挂死，只能断电）。
-2. 一次只改一步，失败即停，不自动重试。
-3. PHY 的 ready 极性曾判反（实物 `bit6=1` 是**已就绪**），别再按旧结论绕 PHY 序列。
+**没通的**：扫描。iOS 只在 Wi-Fi 面板打开时才让 `wifid` 扫，而"自动打开面板"的七轮尝试全部失败，
+根因是**参考内核上我们的用户态定时器不可靠**（`sleep` 偶发不醒、`dispatch_after` 从不执行）。
+详细七轮记录见 `docs/WIFI-REFERENCE-PORT.md` §5.3。
+
+**三条可选的路（按性价比）**：
+
+| 路 | 做法 | 代价 | 能证明什么 |
+|---|---|---|---|
+| **A** | 把 SSID/密码写进镜像 `fw/network`（参考实现的 `lx_os_network`），驱动开机自己连 | 需要你的网络凭据；**不需要任何延时/UI** | 端到端能不能上网（最有说服力） |
+| **B** | 查内核的用户态定时器（我们进程 `sleep` 不醒，iOS 自己的正常） | 几轮实验 | 修好后 UI 自动化、以及其他延时逻辑全通 |
+| **C** | 人在手机边时手动点一次 Settings → Wi-Fi | 一分钟 | 只证明"能扫到" |
+
+**红线不变**：任何一步碰 `0x60000000` / `0x60100000` 前先确认链路已训练；一次只改一步；
+PHY 的 ready 极性是 `bit6=1` 为**已就绪**。
 
 ### P1 ramfs 名字查找 bug（2 天，但可能很关键）
 
@@ -157,8 +164,9 @@
 | 里程碑 | 判据 | 预计 |
 |---|---|---|
 | **M1 设置能留住** | 中文改一次 → 重启 → 仍中文；Wi-Fi 面板里的开关状态也留住 | 本周 |
-| **M2 认出 endpoint** | 日志出现 `QCA6390 endpoint identified`（`17cb:1101`），Gen1 x1 | 2–3 周 |
-| **M3 扫到 SSID** | Settings → Wi-Fi 列出真实热点（不是模拟） | M2 之后 1–3 周 |
+| **M2 认出 endpoint** | `17cb:1101`，LTSSM L0 | ✅ 11-03（`24f4d4a`） |
+| **M2.5 无线电起来** | `en0` 存在、`ath11k returned 0`、station 交给 iOS | ✅ 11-04（照搬路线，§13.18） |
+| **M3 扫到 SSID** | Settings → Wi-Fi 列出真实热点（不是模拟） | 只差这一步 |
 | **M4 真的联网** | 输入密码 → 关联 → DHCP → Safari 打开页面 | 视 M3 的固件 / 协议栈进展 |
 | **M5 观感补齐** | 默认壁纸 + 图标布局跨重启保留 | 与 M2 并行 |
 
@@ -212,6 +220,7 @@ python tools/logdump.py head 8388608   # 查存档头 RDWVAR
 | `docs/SESSION-HANDOFF.md` | 每一轮的实证记录（含失败尝试与原始日志路径）：§13.13 存储显示、§13.15 持久化 |
 | `docs/PROJECT-MAP.md` | 代码 / 脚本在哪、上机速查、GPU 四条路径的辨析 |
 | `docs/PROJECT-PLAN.md`（本文） | 现在到哪、接下来按什么顺序、验收判据 |
+| `docs/WIFI-REFERENCE-PORT.md` | 照搬参考实现的可行性与实录：构建步骤、真机三轮、七轮扫描失败的原因 |
 | `README.md` | 对外口径：只写真机验证过的 |
 
 ---
@@ -220,6 +229,9 @@ python tools/logdump.py head 8388608   # 查存档头 RDWVAR
 
 - **2026-11-03 16:10**：初版。存储显示（`3c3df45`）与持久化（`9c7b712`）已关；主线收敛到
   Wi-Fi 链路；本周先交付中文语言；新增 P1「ramfs 名字查找 bug」。
+- **2026-11-04 15:00**：Wi-Fi 这一层重估。链路（`24f4d4a`）与照搬参考实现（§13.18）都有真机证据：
+  固件搬到 AMSS、`en0` 起来、`ath11k returned 0`；扫描未拿到，根因是参考内核上我们的用户态定时器
+  不可靠。新增 `docs/WIFI-REFERENCE-PORT.md`，P0-2 改成"三条可选的路"。
 - **2026-11-03 16:50**：语言取证（§13.16）。三处 prefs 域名 + 进程内实测把 H1/H3 全部排除；
   loctable 里有真中文（438 键）；问题收敛到"SpringBoard 是否被判为有中文"，并给出一次上机
   即可分开的 H4a/H4b。探针首轮把 SpringBoard 打崩（`AppleLocale` 当数组打印），已修；

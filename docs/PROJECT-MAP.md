@@ -60,7 +60,9 @@
 |---|---|
 | `PROJECT-README.md` | 里程碑、构建命令、启动参数表、已知问题（**部分过时**：说 GPU step 19 卡死，实际已到 step 20 并通过） |
 | `SESSION-HANDOFF.md` | 74 KB 详细交接：硬件事实表、坑、§9 GPU 全记录、§10 下一步 |
-| `unixnu-fft-gpu-ufs.md` | 本轮新增：与 UniXNU-alioth 的逐项对照 + **step 20 通过的实测**（§6） |
+| `unixnu-fft-gpu-ufs.md` | 与 UniXNU-alioth 的逐项对照 + **step 20 通过的实测**（§6） |
+| `WIFI-REFERENCE-PORT.md` | **分支 `wifi-ref-port`**：照搬参考实现的可行性、构建步骤、真机三轮、七轮扫描失败的原因 |
+| `PROJECT-PLAN.md` | 现在到哪、接下来按什么顺序、验收判据 |
 | `evidence/` | 每轮真机日志与截图，按日期命名 |
 | `hardware/` | 硬件档案 |
 | `screenshots/` | 界面截图 |
@@ -74,6 +76,11 @@
 | `tools/pngcrop.py` | 截图 RAW(BGRX) → PNG，可裁剪放大。`pngcrop.py in.raw out.png W H stride x y w h [zoom]` |
 | `tools/symbolize.py` | 用 `.dSYM` 的 DWARF 把 panic 地址反查函数名 |
 | `tools/dump-gpu.sh` / `pci-topology.sh` | 从 Android 侧 dump GPU/PCIe 信息 |
+| `tools/logdump.py` | 从 Android 直读 logdump：`log`（按会话截断）、`head N`（查存档头） |
+| `tools/loctable-langs.py` / `loctable-keys.py` | 读 `.loctable`：有哪些语言、两种语言逐键对照（语言问题的取证工具） |
+| `tools/mkp37.sh` / `mkp38.sh` | pcie=14 的载荷：BHI 只送 512 KiB SBL；p38 换成自有连续缓冲 + 回读 |
+| `ubuntu/ref-wifi-build.sh` | **照搬参考实现的 Wi-Fi**：拉 Linux/FreeBSD 源码、编 `ath11k.o`、内核链进去 |
+| `ubuntu/ref-wifi-payload.sh` | 用参考内核 + 我们的镜像打载荷（`SCENE=` 选场景；含 `QCA=1` 的固件名映射） |
 | `~/k40/tools/gpu-test/` | **GPU 判据测试**：`test_gpu.c`（用户态直测）、`test_tables.py`（校验 SoC 表）、`run.sh` |
 | `~/k40/tools/check-constants.py` | 源码常量 vs 设备树/ABL 表的一致性检查 |
 | `~/k40/tools/apfs/` | APFS 读取器（`apfs.py`、`apfs-tool`），与内核实现交叉验证 |
