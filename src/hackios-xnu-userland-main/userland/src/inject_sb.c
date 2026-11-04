@@ -39,6 +39,7 @@
 #include <mach-o/dyld.h>
 #include <mach/mach_time.h>
 #include <notify.h>
+#include <pthread.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <stdarg.h>
@@ -928,8 +929,7 @@ layers(void)
  * presses of the home button only go home (there is no home button on a phone of this shape, and
  * what is sent as one goes home and no more). SpringBoard opens it itself for anything that is
  * not a gesture (a hardware keyboard, accessibility): SBMainSwitcherControllerCoordinator, which
- * is one for the whole program, takes "activate the main switcher not interactively, from this
- * source". The source is an analytics label; zero is "none", which is what the ones that have no
+ * is one for the whole program, takes "activate the main switcher not interactively, from this\n* source". The source is an analytics label; zero is "none", which is what the ones that have no
  * gesture behind them pass.
  * As it stands this is not enough: with three applications running it answers that it took the
  * request (source 0, animated and not animated alike) and the screen does not change -- the
@@ -1072,8 +1072,7 @@ load_tweaks(void)
 }
 
 /*
- * The volume keys. Backboardd takes the HID events (its log says "[Button] VolumeIncrement page:0xC
- * usage:0xE9 ... down"), but no volume changes: on this port nothing above backboardd acts on them.
+ * The volume keys. Backboardd takes the HID events (its log says "[Button] VolumeIncrement page:0xC\n* usage:0xE9 ... down"), but no volume changes: on this port nothing above backboardd acts on them.
  * SpringBoard's own volume control is what the HUD is drawn for, so step that instead, on the
  * notification inject.c posts when the kernel reports a press -- the side button's lock works the
  * same way (lock_long_press() and its Darwin notification).
@@ -1417,6 +1416,53 @@ language_state(const char *when)
  * home-screen swipe (rc.jobs.unlock), but a tap that has to land on an icon depends on where
  * SpringBoard put it -- and on the reference kernel the pane never came up that way (wifiscan).
  */
+/*
+ * The delayed actions are threads, not dispatch_after blocks. A block scheduled from an injected
+ * library's constructor never ran: thirteen samples of "ln: at start" in the language runs, not one
+ * "25 s in", on our own kernel as well as on the reference one. notify_register_dispatch does work
+ * there (com.redwood.lang is answered), which is what made the blocks look plausible.
+ */
+static void open_wifi_settings(void);      /* defined below, used by the timer thread */
+
+static void *
+after_delay(void *argument)
+{
+	int seconds = (int)(intptr_t)argument;
+
+	/* a heartbeat first: if these do not come out, the thread never ran; if not even the first
+	 * one does, start_after() itself was never reached */
+	say("redwood: timer for %d s armed\n", seconds);
+	for (int i = 1; i <= 3; i++) {
+		sleep((unsigned)(seconds / 4));
+		say("redwood: timer %d s: heartbeat %d\n", seconds, i);
+	}
+	sleep((unsigned)(seconds / 4));
+	if (access("/private/var/mobile/open-wifi", F_OK) == 0) {
+		open_wifi_settings();
+	} else {
+		say("redwood: no marker for Settings; nothing to open\n");
+	}
+	return NULL;
+}
+
+static void
+start_after(int seconds)
+{
+	pthread_t thread;
+	pthread_attr_t attributes;
+
+	fprintf(stderr, "redwood: start_after(%d) called\n", seconds);
+
+	if (pthread_attr_init(&attributes) != 0) {
+		return;
+	}
+	pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
+	if (pthread_create(&thread, &attributes, after_delay, (void *)(intptr_t)seconds) != 0) {
+		say("redwood: the %d s timer could not be started\n", seconds);
+	}
+	pthread_attr_destroy(&attributes);
+}
+
 static void
 open_wifi_settings(void)
 {
@@ -1511,18 +1557,8 @@ redwood_springboard_init(void)
 		 * not decided here and now: SpringBoard is still laying out its icons this early, and the
 		 * marker does not exist yet at this point of the boot either. The checks are late ones.
 		 */
-		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 25 * NSEC_PER_SEC),
-		    dispatch_get_main_queue(), ^{
-			if (access("/private/var/mobile/open-wifi", F_OK) == 0) {
-				open_wifi_settings();
-			}
-		});
-		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 55 * NSEC_PER_SEC),
-		    dispatch_get_main_queue(), ^{
-			if (access("/private/var/mobile/open-wifi", F_OK) == 0) {
-				open_wifi_settings();
-			}
-		});
+		start_after(25);
+		start_after(55);
 		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 &&
 		    strstr(arguments, "lang_probe=1") != NULL) {
 			language_state("at start");

@@ -1,17 +1,18 @@
-# Opening Settings -> Wi-Fi, so that something asks the radio to scan.
+# Opening Settings' Wi-Fi pane, so that something asks the radio to scan.
 #
-# Nothing scans on its own: iOS lists networks only while the Wi-Fi pane is open -- wifid asks
-# apple80211 for a scan, the reference implementation's lx layer hands it to ath11k, and the firmware
-# answers. The touches are the ones rc.jobs.launch already proved on this port: a swipe from the
-# bottom edge dismisses the lock screen, then a tap on the Settings icon at (0.615, 0.71). The first
-# attempt (wifiscan, 13:39) tapped at 20 s without the swipe, while the lock screen was still up,
-# and nothing happened.
+# iOS lists networks only while the Wi-Fi pane is open: wifid asks apple80211 for a scan, the
+# reference implementation's lx layer hands it to ath11k, the firmware answers. The pane is opened
+# by libredwood-sb.dylib, which answers the notification com.redwood.wifi by asking LaunchServices
+# for "App-Prefs:root=WIFI" (src/inject_sb.c).
 #
-#   40 s  the lock screen goes away
-#   46 s  Settings
-#   52 s  the Wi-Fi row, the second row of the first group
-#   then  a tap in the middle of the list every 20 s, which a scan result does not mind: the pane
-#         stays open and awake until the run ends
-/redwood/bin/rwtouch wait 40 swipe 0.5 0.985 0.5 0.3 200 wait 6 tap 0.615 0.71 wait 6 tap 0.5 0.25
-/redwood/bin/rwtouch wait 20 tap 0.5 0.55
-/redwood/bin/rwtouch wait 20 tap 0.5 0.55
+# The notification is posted by a program of its own after a `sleep`, not by rwtouch's own `wait`:
+# `rwtouch wait 25 notify com.redwood.wifi` printed its command line and then never came back
+# (wifiscan3, 13:51), while `sleep 40` followed by `rwtouch notify` is exactly what rc.jobs.lang
+# does and it is answered every time.
+#
+# 30 s is after SpringBoard has its icons; 60 s more keeps the run alive while the pane scans.
+sleep 30
+/redwood/bin/rwtouch notify com.redwood.wifi
+sleep 60
+/redwood/bin/rwtouch notify com.redwood.wifi
+sleep 40
